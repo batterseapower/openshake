@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, TypeFamilies, FlexibleContexts, StandaloneDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, TypeFamilies, FlexibleContexts, StandaloneDeriving, FlexibleInstances #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -151,8 +151,38 @@ defaultOracle = SO go
     go ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
     go question     = error $ "The default oracle cannot answer the question " ++ show question
 
-ls :: FilePath -> Act StringOracle [FilePath]
-ls fp = fmap unSA $ query $ SQ ("ls", fp)
+
+instance (Oracle o1, Oracle o2) => Oracle (o1, o2) where
+    data Question (o1, o2) = QO1 (Question o1) | QO2 (Question o2)
+    data Answer (o1, o2) = AO1 (Answer o1) | AO2 (Answer o2)
+    askOracle (o1, _) (QO1 q1) = AO1 (askOracle o1 q1)
+    askOracle (_, o2) (QO2 q2) = AO2 (askOracle o2 q2)
+
+deriving instance (Oracle o1, Oracle o2) => Eq (Question (o1, o2))
+deriving instance (Oracle o1, Oracle o2) => Show (Question (o1, o2))
+deriving instance (Oracle o1, Oracle o2) => Read (Question (o1, o2))
+deriving instance (Oracle o1, Oracle o2) => Eq (Answer (o1, o2))
+deriving instance (Oracle o1, Oracle o2) => Show (Answer (o1, o2))
+deriving instance (Oracle o1, Oracle o2) => Read (Answer (o1, o2))
+
+
+class Oracle o => OracleLs o where
+    lsQuestion :: FilePath -> Question o
+    lsAnswer :: Answer o -> [FilePath]
+
+ls :: OracleLs o => FilePath -> Act o [FilePath]
+ls = fmap lsAnswer . query . lsQuestion
+
+instance OracleLs StringOracle where
+    lsQuestion fp = SQ ("ls", fp)
+    lsAnswer = unSA
+
+
+-- TODO: unidirected search..
+instance (OracleLs o1, Oracle o2) => OracleLs (o1, o2) where
+    lsQuestion = QO1 . lsQuestion
+    lsAnswer = lsAnswer . unAO1
+      where unAO1 (AO1 x) = x
 
 
 -- TODO: do files in parallel (Add "Building (MVar ())" constructor to the Database, and put Database into an MVar)
