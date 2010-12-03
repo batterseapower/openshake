@@ -1,0 +1,11 @@
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Shake database
+.openshake-db
+
+# Build artifacts
+dist/
+*.o
+*.hi

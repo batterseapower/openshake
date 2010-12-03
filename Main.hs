@@ -2,7 +2,7 @@
 import Control.Applicative (Applicative)
 import Control.Arrow (first)
 
-import Control.Exception
+import qualified Control.Exception as Exception
 
 import Control.Monad
 import qualified Control.Monad.Trans.Reader as Reader
@@ -19,19 +19,20 @@ import Data.List
 
 import System.Directory
 import System.FilePath
+import System.FilePath.Glob
 import System.Time (CalendarTime, toCalendarTime)
 
 import qualified System.Process as Process
 import System.Exit
 
+import System.IO
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Unsafe
-
-import Text.Regex.Posix
+import System.IO.Temp
 
 
 handleDoesNotExist :: IO a -> IO (Maybe a)
-handleDoesNotExist act = handleJust (guard . isDoesNotExistError) (\() -> return Nothing) (fmap Just act)
+handleDoesNotExist act = Exception.handleJust (guard . isDoesNotExistError) (\() -> return Nothing) (fmap Just act)
 
 expectJust :: String -> Maybe a -> a
 expectJust _   (Just x) = x
@@ -47,12 +48,9 @@ anyM p = go
 
 
 data Rule = R {
-    r_pattern :: String,
+    r_pattern :: Pattern,
     r_action :: FilePath -> Act ()
   }
-
-patternMatches :: String -> FilePath -> Bool
-patternMatches pattern fp = pattern =~ fp
 
 data ShakeState = SS {
     ss_rules :: [Rule],
@@ -135,10 +133,10 @@ shake mx = do
     ((), final_s) <- runShake (SE { se_oracle = default_oracle }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_db }) mx
     writeFile ".openshake-db" (show mb_db)
   where
-    -- Doesn't work because we want to do things like "ls *.c"
+    -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
     --default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
-    default_oracle ("ls", fp) = lines $ unsafePerformIO $ Process.readProcess "ls" [fp] ""
-    default_oracle question   = error $ "The default oracle cannot answer the question " ++ show question
+    default_oracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
+    default_oracle question     = error $ "The default oracle cannot answer the question " ++ show question
 
 ls :: FilePath -> Act [FilePath]
 ls fp = query ("ls", fp)
@@ -157,7 +155,7 @@ want fps = do
 (*>) :: String -> (FilePath -> Act ()) -> Shake ()
 (*>) pattern action = do
     s <- getShakeState
-    putShakeState $ s { ss_rules = R { r_pattern = pattern, r_action = action } : ss_rules s }
+    putShakeState $ s { ss_rules = R { r_pattern = compile pattern, r_action = action } : ss_rules s }
 
 -- TODO: do subrules in parallel
 need :: [FilePath] -> Act ()
@@ -198,7 +196,7 @@ appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_hi
 runRule :: FilePath -> Act ModTime
 runRule fp = do
     e <- askActEnv
-    case [rule | rule <- ae_global_rules e, r_pattern rule `patternMatches` fp] of
+    case [rule | rule <- ae_global_rules e, r_pattern rule `match` fp] of
         [rule] -> do
             s <- getActState
             ((), s) <- liftIO $ runAct e s (r_action rule fp)
@@ -236,6 +234,27 @@ query question = do
     return answer
 
 
+checkExitCode :: (Show a, Monad m) => a -> ExitCode -> m ()
+checkExitCode cmd ec = case ec of
+    ExitSuccess   -> return ()
+    ExitFailure i -> error $ "system': system command " ++ show cmd ++ " failed with exit code " ++ show i
+
+system' :: MonadIO m => [String] -> m ()
+system' prog = do
+    ec <- system prog
+    checkExitCode prog ec
+
+system :: MonadIO m => [String] -> m ExitCode
+system prog = liftIO $ Process.system $ intercalate " " prog
+
+systemStdout' :: MonadIO m => [String] -> m String
+systemStdout' prog = liftIO $ withSystemTempDirectory "openshake" $ \tmpdir -> do
+    let stdout_fp = tmpdir </> "stdout" <.> "txt"
+    ec <- Process.system $ intercalate " " prog ++ " > " ++ stdout_fp
+    checkExitCode prog ec
+    readFile stdout_fp
+
+
 -- Example build system
 
 readFileLines :: FilePath -> Act [String]
@@ -255,37 +274,27 @@ copy from to = do
 mkdir :: FilePath -> Act ()
 mkdir fp = liftIO $ createDirectoryIfMissing True fp
 
-system' :: [String] -> Act ()
-system' prog = do
-    ec <- system prog
-    case ec of
-        ExitSuccess   -> return ()
-        ExitFailure i -> error $ "system': system command " ++ show prog ++ " failed with exit code " ++ show i
-
-system :: [String] -> Act ExitCode
-system prog = liftIO $ Process.system $ intercalate " " prog
-
 cIncludes :: FilePath -> Act [FilePath]
 cIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack
     -- FIXME: transitive dependencies
     trim p = dropWhile p . reverse . dropWhile p . reverse
-    strip = trim (\x -> isSpace x || x == '\"')
-    takeInclude xs | "#include" `isPrefixOf` map toLower xs = Just $ strip (drop (length "#include") xs)
-                   | otherwise = Nothing
+    takeInclude xs = guard ("#include" `isPrefixOf` map toLower xs) >> stripQuotes (trim isSpace (drop (length "#include") xs))
+    stripQuotes ('\"':xs) = guard (not (null xs) && last xs == '\"') >> return (init xs)
+    stripQuotes _ = Nothing
 
 main :: IO ()
 main = shake $ do
-    "Main.exe" *> \x -> do
+    "Main" *> \x -> do
         cs <- ls "*.c"
-        let os = map (`replaceExtension` "obj") cs
+        let os = map (`replaceExtension` "o") cs
         need os
         system' $ ["gcc","-o",x] ++ os
-    "*.obj" *> \x -> do
+    "*.o" *> \x -> do
         let c = replaceExtension x "c"
         need [c]
         need =<< cIncludes c
         system' ["gcc","-c",c,"-o",x]
-    want ["Main.exe"]
+    want ["Main"]
         
