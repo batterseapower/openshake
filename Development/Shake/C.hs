@@ -12,7 +12,7 @@ import Data.List
 import Data.Maybe
 
 
-cIncludes :: Oracle o => FilePath -> Act o [FilePath]
+cIncludes :: Oracle o q a => FilePath -> Act o [FilePath]
 cIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack

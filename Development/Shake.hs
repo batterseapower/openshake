@@ -1,4 +1,5 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, TypeFamilies, FlexibleContexts, StandaloneDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, FlexibleContexts, StandaloneDeriving #-}
+{-# LANGUAGE FlexibleInstances, MultiParamTypeClasses, FunctionalDependencies, ExistentialQuantification, UndecidableInstances, ScopedTypeVariables #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -9,7 +10,7 @@ module Development.Shake (
     Act, need, query,
     
     -- * Oracles, the default oracle and wrappers for the questions it can answer
-    Oracle, Question, Answer, defaultOracle, ls
+    Oracle, defaultOracle, ls
   ) where
 
 import Development.Shake.Utilities
@@ -82,18 +83,14 @@ getModTime fp = handleDoesNotExist (getModificationTime fp >>= toCalendarTime)
 
 
 type History o = [QA o]
-data QA o = Oracle (Question o) (Answer o)
+data QA o = forall q a. Oracle o q a => Oracle q a
           | Need [(FilePath, ModTime)]
 
-deriving instance Oracle o => Show (QA o)
-deriving instance Oracle o => Read (QA o)
-
-{-
-instance Oracle o => Show (QA o) where
+instance Show (QA o) where
     showsPrec prec (Oracle q a) = showParen (prec > 9) $ showString "Oracle " . showsPrec 10 q . showString " " . showsPrec 10 a
     showsPrec prec (Need xes)   = showParen (prec > 9) $ showString "Need " . showsPrec 10 xes
 
-instance Read (QA o) where
+instance Oracle o q a => Read (QA o) where
     readsPrec _prec s = do
       (token, s) <- lex s
       case token of
@@ -104,12 +101,28 @@ instance Read (QA o) where
           "Need" -> do
               (xes, s) <- readsPrec 10 s
               return (Need xes, s)
--}
+          _ -> []
 
 type Database o = Map FilePath (Status o)
 data Status o = Dirty (History o)
               | Clean (History o) ModTime
-              deriving (Show, Read)
+
+instance Show (Status o) where
+    showsPrec prec (Dirty hist)       = showParen (prec > 9) $ showString "Dirty " . showsPrec 10 hist
+    showsPrec prec (Clean hist mtime) = showParen (prec > 9) $ showString "Clean " . showsPrec 10 hist . showString " " . showsPrec 10 mtime
+
+instance Oracle o q a => Read (Status o) where
+    readsPrec _prec s = do
+      (token, s) <- lex s
+      case token of
+          "Dirty" -> do
+              (hist, s) <- readsPrec 10 s
+              return (Dirty hist, s)
+          "Clean" -> do
+              (hist, s) <- readsPrec 10 s
+              (mtime, s) <- readsPrec 10 s
+              return (Clean hist mtime, s)
+          _ -> []
 
 
 data ActState o = AS {
@@ -141,7 +154,7 @@ askActEnv = Act Reader.ask
 shake :: Shake StringOracle () -> IO ()
 shake = shakeWithOracle defaultOracle
 
-shakeWithOracle :: Oracle o => o -> Shake o () -> IO ()
+shakeWithOracle :: Oracle o q a => o -> Shake o () -> IO ()
 shakeWithOracle orac mx = do
     mb_s <- handleDoesNotExist (readFile ".openshake-db")
     let mb_init_db = mb_s >>= readMaybe -- The database may not parse with a new oracle, so we will throw it away
@@ -154,12 +167,8 @@ shakeWithOracle orac mx = do
 
 newtype StringOracle = SO { _unSO :: (String, String) -> [String] }
 
-instance Oracle StringOracle where
-    data Question StringOracle = SQ { _unSQ :: (String, String) }
-                               deriving (Show, Read, Eq)
-    data Answer StringOracle = SA { unSA :: [String] }
-                             deriving (Show, Read, Eq)
-    askOracle (SO o) (SQ q) = SA (o q)
+instance Oracle StringOracle (String, String) [String] where
+    askOracle (SO o) q = o q
 
 defaultOracle :: StringOracle
 defaultOracle = SO go
@@ -170,7 +179,7 @@ defaultOracle = SO go
     go question     = error $ "The default oracle cannot answer the question " ++ show question
 
 ls :: FilePath -> Act StringOracle [FilePath]
-ls fp = fmap unSA $ query $ SQ ("ls", fp)
+ls fp = query ("ls", fp)
 
 
 -- TODO: do files in parallel (Add "Building (MVar ())" constructor to the Database, and put Database into an MVar)
@@ -208,7 +217,7 @@ addRule :: Rule o -> Shake o ()
 addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 
 -- TODO: do subrules in parallel
-need :: Oracle o => [FilePath] -> Act o ()
+need :: forall o q a. Oracle o q a => [FilePath] -> Act o ()
 need fps = do
     init_db <- fmap as_database getActState
     let (uncleans, cleans) = partitionEithers $
@@ -218,7 +227,8 @@ need fps = do
           | fp <- fps
           ]
     
-    let history_requires_rerun (Oracle question old_answer) = do
+    let history_requires_rerun :: QA o -> Act o Bool
+        history_requires_rerun (Oracle question old_answer) = do
             new_answer <- unsafeQuery question
             return (old_answer /= new_answer)
         history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
@@ -275,23 +285,20 @@ runRule fp = do
                   return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
         _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
-class (Show (Question o), Show (Answer o), Read (Question o), Read (Answer o), Eq (Question o), Eq (Answer o)) => Oracle o where
-    data Question o
-    data Answer o
-    askOracle :: o -> Question o -> Answer o
-    --packQA :: Question o -> Answer o -> QA
+class (Show q, Show a, Read q, Read a, Eq q, Eq a) => Oracle o q a | o -> q a where
+    askOracle :: o -> q -> a
 
 -- TODO: allow the type of the oracle to change?
-oracle :: Oracle o => o -> Shake o a -> Shake o a
+oracle :: Oracle o q a => o -> Shake o a -> Shake o a
 oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: some way to combine with previous oracle?
 
 -- | Like 'query', but doesn't record that the question was asked
-unsafeQuery :: Oracle o => Question o -> Act o (Answer o)
+unsafeQuery :: Oracle o q a => q -> Act o a
 unsafeQuery question = do
     e <- askActEnv
     return $ askOracle (ae_global_oracle e) question
 
-query :: Oracle o => Question o -> Act o (Answer o)
+query :: Oracle o q a => q -> Act o a
 query question = do
     answer <- unsafeQuery question
     appendHistory $ Oracle question answer
