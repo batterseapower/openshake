@@ -2,7 +2,7 @@
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
-    Rule, AlsoFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
+    Rule, CreatesFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
     want, oracle,
     
     -- * The monadic interface used by rule bodies
@@ -34,8 +34,8 @@ import System.Time (CalendarTime, toCalendarTime)
 import System.IO.Unsafe
 
 
-type AlsoFiles = [FilePath]
-type Rule = FilePath -> Maybe (AlsoFiles, Act ())
+type CreatesFiles = [FilePath]
+type Rule = FilePath -> Maybe (CreatesFiles, Act ())
 
 data ShakeState = SS {
     ss_rules :: [Rule],
@@ -147,21 +147,21 @@ want fps = do
 (*>) pattern action = (compiled `match`) ?> action
   where compiled = compile pattern
 
-(*@>) :: (String, AlsoFiles) -> (FilePath -> Act ()) -> Shake ()
+(*@>) :: (String, CreatesFiles) -> (FilePath -> Act ()) -> Shake ()
 (*@>) (pattern, alsos) action = (\fp -> guard (compiled `match` fp) >> return alsos) ?@> action
   where compiled = compile pattern
 
 (**>) :: (FilePath -> Maybe a) -> (FilePath -> a -> Act ()) -> Shake ()
-(**>) p action = addRule $ \fp -> p fp >>= \x -> return ([], action fp x)
+(**>) p action = addRule $ \fp -> p fp >>= \x -> return ([fp], action fp x)
 
-(**@>) :: (FilePath -> Maybe (AlsoFiles, a)) -> (FilePath -> a -> Act ()) -> Shake ()
-(**@>) p action = addRule $ \fp -> p fp >>= \(alsos, x) -> return (alsos, action fp x)
+(**@>) :: (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act ()) -> Shake ()
+(**@>) p action = addRule $ \fp -> p fp >>= \(creates, x) -> return (creates, action fp x)
 
 (?>) :: (FilePath -> Bool) -> (FilePath -> Act ()) -> Shake ()
-(?>) p action = addRule $ \fp -> guard (p fp) >> return ([], action fp)
+(?>) p action = addRule $ \fp -> guard (p fp) >> return ([fp], action fp)
 
-(?@>) :: (FilePath -> Maybe AlsoFiles) -> (FilePath -> Act ()) -> Shake ()
-(?@>) p action = addRule $ \fp -> p fp >>= \alsos -> return (alsos, action fp)
+(?@>) :: (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act ()) -> Shake ()
+(?@>) p action = addRule $ \fp -> p fp >>= \creates -> return (creates, action fp)
 
 
 addRule :: Rule -> Shake ()
@@ -189,39 +189,50 @@ need fps = do
     unclean_times <- forM uncleans $ \(unclean_fp, mb_hist) -> do
         mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
                                          Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
-        (nested_hist, nested_time) <- case mb_clean_hist of
-          Nothing         -> runRule unclean_fp
-          Just clean_hist -> fmap ((,) clean_hist) $ get_clean_mod_time unclean_fp -- We are actually Clean, though the history doesn't realise it yet..
+        nested_time <- case mb_clean_hist of
+          Nothing         -> runRule unclean_fp -- runRule will deal with marking the file clean
+          Just clean_hist -> do
+            -- We are actually Clean, though the history doesn't realise it yet..
+            nested_time <- get_clean_mod_time unclean_fp
+            markClean unclean_fp clean_hist nested_time
+            return nested_time
         
-        -- The file must now be clean, so make sure we record that fact in the database:
-        modifyActState $ \s -> s { as_database = M.insert unclean_fp (Clean nested_hist nested_time) (as_database s) }
+        -- The file must now be Clean!
         return (unclean_fp, nested_time)
     
     clean_times <- forM cleans $ \clean_fp -> fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     appendHistory $ Need (unclean_times ++ clean_times)
 
+markClean :: FilePath -> History -> ModTime -> Act ()
+markClean fp nested_hist nested_time = modifyActState $ \s -> s { as_database = M.insert fp (Clean nested_hist nested_time) (as_database s) }
+
 appendHistory :: QA -> Act ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
-runRule :: FilePath -> Act (History, ModTime)
+-- NB: when runRule returns, the input file will be clean (and probably some others, too..)
+runRule :: FilePath -> Act ModTime
 runRule fp = do
     e <- askActEnv
-    case [action | rule <- ae_global_rules e, Just action <- [rule fp]] of
-        [(alsos, action)] -> do
-            -- FIXME: deal with alsos
+    case [(creates_fps, action) | rule <- ae_global_rules e, Just (creates_fps, action) <- [rule fp]] of
+        [(creates_fps, action)] -> do
             init_db <- fmap as_database getActState
             ((), final_nested_s) <- liftIO $ runAct e (AS { as_this_history = [], as_database = init_db }) action
             modifyActState $ \s -> s { as_database = as_database final_nested_s }
             
-            nested_time <- fmap (expectJust $ "The matching rule did not create " ++ fp) $ liftIO $ getModTime fp
-            return (as_this_history final_nested_s, nested_time)
+            creates_time <- forM creates_fps $ \creates_fp -> do
+                nested_time <- fmap (expectJust $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getModTime creates_fp
+                markClean creates_fp (as_this_history final_nested_s) nested_time
+                return (creates_fp, nested_time)
+            return $ expectJust ("The rule didn't create the file that we originally asked for, " ++ fp) $ lookup fp creates_time
         [] -> do
             -- Not having a rule might still be OK, as long as there is some existing file here:
             mb_nested_time <- liftIO $ getModTime fp
             case mb_nested_time of
                 Nothing          -> error $ "No rule to build " ++ fp
-                Just nested_time -> return ([], nested_time) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+                Just nested_time -> do
+                  markClean fp [] nested_time
+                  return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
         _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
