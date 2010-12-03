@@ -2,7 +2,7 @@
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
-    (*>), (**>), (?>), addRule,
+    Rule, AlsoFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
     want, oracle,
     
     -- * The monadic interface used by rule bodies
@@ -34,8 +34,8 @@ import System.Time (CalendarTime, toCalendarTime)
 import System.IO.Unsafe
 
 
--- TODO: deal with "also" files
-type Rule = FilePath -> Maybe (Act ())
+type AlsoFiles = [FilePath]
+type Rule = FilePath -> Maybe (AlsoFiles, Act ())
 
 data ShakeState = SS {
     ss_rules :: [Rule],
@@ -147,11 +147,22 @@ want fps = do
 (*>) pattern action = (compiled `match`) ?> action
   where compiled = compile pattern
 
+(*@>) :: (String, AlsoFiles) -> (FilePath -> Act ()) -> Shake ()
+(*@>) (pattern, alsos) action = (\fp -> guard (compiled `match` fp) >> return alsos) ?@> action
+  where compiled = compile pattern
+
 (**>) :: (FilePath -> Maybe a) -> (FilePath -> a -> Act ()) -> Shake ()
-(**>) p action = addRule $ \fp -> p fp >>= \x -> return (action fp x)
+(**>) p action = addRule $ \fp -> p fp >>= \x -> return ([], action fp x)
+
+(**@>) :: (FilePath -> Maybe (AlsoFiles, a)) -> (FilePath -> a -> Act ()) -> Shake ()
+(**@>) p action = addRule $ \fp -> p fp >>= \(alsos, x) -> return (alsos, action fp x)
 
 (?>) :: (FilePath -> Bool) -> (FilePath -> Act ()) -> Shake ()
-(?>) p action = addRule $ \fp -> guard (p fp) >> return (action fp)
+(?>) p action = addRule $ \fp -> guard (p fp) >> return ([], action fp)
+
+(?@>) :: (FilePath -> Maybe AlsoFiles) -> (FilePath -> Act ()) -> Shake ()
+(?@>) p action = addRule $ \fp -> p fp >>= \alsos -> return (alsos, action fp)
+
 
 addRule :: Rule -> Shake ()
 addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
@@ -197,7 +208,8 @@ runRule :: FilePath -> Act (History, ModTime)
 runRule fp = do
     e <- askActEnv
     case [action | rule <- ae_global_rules e, Just action <- [rule fp]] of
-        [action] -> do
+        [(alsos, action)] -> do
+            -- FIXME: deal with alsos
             init_db <- fmap as_database getActState
             ((), final_nested_s) <- liftIO $ runAct e (AS { as_this_history = [], as_database = init_db }) action
             modifyActState $ \s -> s { as_database = as_database final_nested_s }
@@ -210,7 +222,7 @@ runRule fp = do
             case mb_nested_time of
                 Nothing          -> error $ "No rule to build " ++ fp
                 Just nested_time -> return ([], nested_time) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-        _sactions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
+        _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
 type Answer = [String]
