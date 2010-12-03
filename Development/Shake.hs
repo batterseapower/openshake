@@ -1,4 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, TypeFamilies, FlexibleContexts, StandaloneDeriving, FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -120,7 +121,7 @@ askActEnv :: Act o (ActEnv o)
 askActEnv = Act Reader.ask
 
 
-shake :: Shake StringOracle () -> IO ()
+shake :: Shake (LsT StringOracle) () -> IO ()
 shake = shakeWithOracle defaultOracle
 
 shakeWithOracle :: Oracle o => o -> Shake o () -> IO ()
@@ -143,8 +144,8 @@ instance Oracle StringOracle where
                              deriving (Show, Read, Eq)
     askOracle (SO o) (SQ q) = SA (o q)
 
-defaultOracle :: StringOracle
-defaultOracle = SO go
+defaultOracle :: LsT StringOracle
+defaultOracle = QAT LsQ $ SO go
   where
     -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
     --go ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
@@ -152,37 +153,68 @@ defaultOracle = SO go
     go question     = error $ "The default oracle cannot answer the question " ++ show question
 
 
-instance (Oracle o1, Oracle o2) => Oracle (o1, o2) where
-    data Question (o1, o2) = QO1 (Question o1) | QO2 (Question o2)
-    data Answer (o1, o2) = AO1 (Answer o1) | AO2 (Answer o2)
-    askOracle (o1, _) (QO1 q1) = AO1 (askOracle o1 q1)
-    askOracle (_, o2) (QO2 q2) = AO2 (askOracle o2 q2)
+class OracleTrans t where
+    liftQuestion :: Oracle o => Question o -> Question (t o)
+    liftAnswer :: Oracle o => Answer (t o) -> Answer o
+    liftQuery :: Oracle o => (Question (t o) -> Act (t o) (Answer (t o))) -> Question o -> Act (t o) (Answer o)
+    liftQuery query = fmap liftAnswer . query . liftQuestion
 
-deriving instance (Oracle o1, Oracle o2) => Eq (Question (o1, o2))
-deriving instance (Oracle o1, Oracle o2) => Show (Question (o1, o2))
-deriving instance (Oracle o1, Oracle o2) => Read (Question (o1, o2))
-deriving instance (Oracle o1, Oracle o2) => Eq (Answer (o1, o2))
-deriving instance (Oracle o1, Oracle o2) => Show (Answer (o1, o2))
-deriving instance (Oracle o1, Oracle o2) => Read (Answer (o1, o2))
+instance OracleTrans (QAT qa) where
+    liftQuestion q = QAQuestionLifted q
+    liftAnswer (QAAnswerLifted a) = a
 
 
-class Oracle o => OracleLs o where
-    lsQuestion :: FilePath -> Question o
-    lsAnswer :: Answer o -> [FilePath]
+data QAT qa o = QAT { qat_data :: qa, dat_nested :: o }
+type LsT = QAT LsQ
+type CwdT = QAT CwdQ
 
-ls :: OracleLs o => FilePath -> Act o [FilePath]
-ls = fmap lsAnswer . query . lsQuestion
+class (Show (QAAnswer qa), Show (QAQuestion qa), Read (QAAnswer qa), Read (QAQuestion qa), Eq (QAAnswer qa), Eq (QAQuestion qa)) => QAC qa where
+    type QAQuestion qa
+    type QAAnswer qa
+    answer :: qa -> QAQuestion qa -> QAAnswer qa
 
-instance OracleLs StringOracle where
-    lsQuestion fp = SQ ("ls", fp)
-    lsAnswer = unSA
+data LsQ = LsQ
+
+instance QAC LsQ where
+    type QAQuestion LsQ = FilePath
+    type QAAnswer LsQ = [FilePath]
+    answer LsQ what = lines $ unsafePerformIO $ systemStdout' ["ls", what]
+
+data CwdQ = CwdQ
+
+instance QAC CwdQ where
+    type QAQuestion CwdQ = ()
+    type QAAnswer CwdQ = FilePath
+    answer CwdQ () = unsafePerformIO getCurrentDirectory
+
+instance (QAC qa, Oracle o) => Oracle (QAT qa o) where
+    data Question (QAT qa o) = QAQuestion (QAQuestion qa) | QAQuestionLifted (Question o)
+    data Answer (QAT qa o) = QAAnswer (QAAnswer qa) | QAAnswerLifted (Answer o)
+    askOracle (QAT _  o) (QAQuestionLifted q) = QAAnswerLifted $ askOracle o q
+    askOracle (QAT qa _) (QAQuestion q)       = QAAnswer $ answer qa q
 
 
--- TODO: unidirected search..
-instance (OracleLs o1, Oracle o2) => OracleLs (o1, o2) where
-    lsQuestion = QO1 . lsQuestion
-    lsAnswer = lsAnswer . unAO1
-      where unAO1 (AO1 x) = x
+class Oracle o => OracleContained o o_top where
+    liftQueryMany :: (Question o_top -> Act o_top (Answer o_top)) -> Question o -> Act o_top (Answer o)
+
+instance (Oracle o, QAC qa) => OracleContained (QAT qa o) (QAT qa o) where
+    liftQueryMany = id
+
+instance OracleContained (QAT qa1 o1) o2 => OracleContained (QAT qa1 o1) (QAT qa2 o2) where
+    liftQueryMany = liftQuery . liftQueryMany
+
+  
+ls :: (Oracle o, Oracle o', OracleContained (QAT LsQ o') o) => FilePath -> Act o [FilePath]
+ls = fmap unLsAnswer . liftQueryMany query . QAQuestion
+  where unLsAnswer (QAAnswer fps) = fps
+
+
+deriving instance (Oracle o, QAC qa) => Eq (Question (QAT qa o))
+deriving instance (Oracle o, QAC qa) => Show (Question (QAT qa o))
+deriving instance (Oracle o, QAC qa) => Read (Question (QAT qa o))
+deriving instance (Oracle o, QAC qa) => Eq (Answer (QAT qa o))
+deriving instance (Oracle o, QAC qa) => Show (Answer (QAT qa o))
+deriving instance (Oracle o, QAC qa) => Read (Answer (QAT qa o))
 
 
 -- TODO: do files in parallel (Add "Building (MVar ())" constructor to the Database, and put Database into an MVar)
