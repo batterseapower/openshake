@@ -46,6 +46,10 @@ anyM p = go
             if b then return True
                  else go xs
 
+(?) :: Bool -> (a, a) -> a
+True  ? (t, _) = t
+False ? (_, f) = f
+
 
 data Rule = R {
     r_pattern :: Pattern,
@@ -131,7 +135,7 @@ shake :: Shake () -> IO ()
 shake mx = do
     mb_db <- handleDoesNotExist (fmap read $ readFile ".openshake-db")
     ((), final_s) <- runShake (SE { se_oracle = default_oracle }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_db }) mx
-    writeFile ".openshake-db" (show mb_db)
+    writeFile ".openshake-db" (show $ ss_database final_s)
   where
     -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
     --default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
@@ -177,14 +181,15 @@ need fps = do
     
         get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ liftIO $ getModTime fp
     unclean_times <- forM uncleans $ \(unclean_fp, mb_hist) -> do
-        must_rerun <- case mb_hist of Nothing   -> return True
-                                      Just hist -> anyM history_requires_rerun hist
-        this_time <- if must_rerun
-                      then runRule unclean_fp -- NB: runRule will set unclean_fp to Clean in the resulting database (along with possibily more stuff!)
-                      else get_clean_mod_time unclean_fp -- Because we are actually Clean, though the history doesn't realise it yet..
+        mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
+                                         Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
+        (nested_hist, nested_time) <- case mb_clean_hist of
+          Nothing         -> runRule unclean_fp
+          Just clean_hist -> fmap ((,) clean_hist) $ get_clean_mod_time unclean_fp -- We are actually Clean, though the history doesn't realise it yet..
         
-        -- FIXME: must switch to Clean with new modtime
-        return (unclean_fp, this_time)
+        -- The file must now be clean, so make sure we record that fact in the database:
+        modifyActState $ \s -> s { as_database = M.insert unclean_fp (Clean nested_hist nested_time) (as_database s) }
+        return (unclean_fp, nested_time)
     
     clean_times <- forM cleans $ \clean_fp -> fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
@@ -193,25 +198,23 @@ need fps = do
 appendHistory :: QA -> Act ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
-runRule :: FilePath -> Act ModTime
+runRule :: FilePath -> Act (History, ModTime)
 runRule fp = do
     e <- askActEnv
     case [rule | rule <- ae_global_rules e, r_pattern rule `match` fp] of
         [rule] -> do
-            s <- getActState
-            ((), s) <- liftIO $ runAct e s (r_action rule fp)
-            putActState s
+            init_db <- fmap as_database getActState
+            ((), final_nested_s) <- liftIO $ runAct e (AS { as_this_history = [], as_database = init_db }) (r_action rule fp)
+            modifyActState $ \s -> s { as_database = as_database final_nested_s }
             
-            -- FIXME: record as clean
-            this_time <- fmap (expectJust $ "The matching rule did not create " ++ fp) $ liftIO $ getModTime fp
-            return this_time
+            nested_time <- fmap (expectJust $ "The matching rule did not create " ++ fp) $ liftIO $ getModTime fp
+            return (as_this_history final_nested_s, nested_time)
         [] -> do
             -- Not having a rule might still be OK, as long as there is some existing file here:
-            mb_this_time <- liftIO $ getModTime fp
-            case mb_this_time of
-                Nothing        -> error $ "No rule to build " ++ fp
-                Just this_time -> return this_time -- FIXME: record as Clean then
-                                                   -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+            mb_nested_time <- liftIO $ getModTime fp
+            case mb_nested_time of
+                Nothing          -> error $ "No rule to build " ++ fp
+                Just nested_time -> return ([], nested_time) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
         rules -> error $ "Ambiguous rules for " ++ fp ++ " (matched the patterns " ++ intercalate ", " (map (show . r_pattern) rules) ++ ")" -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
