@@ -238,9 +238,8 @@ want :: [FilePath] -> Shake ()
 want fps = do
     e <- askShakeEnv
     s <- getShakeState
-    liftIO $ parallel_ $ flip map fps $ \fp -> do
-      (_time, _final_s) <- runAct (AE { ae_global_rules = ss_rules s, ae_global_oracle = se_oracle e, ae_global_database = ss_database s }) (AS { as_this_history = [] }) (runRule fp)
-      return ()
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_oracle = se_oracle e, ae_global_database = ss_database s }) (AS { as_this_history = [] }) (need fps)
+    return ()
 
 (*>) :: String -> (FilePath -> Act ()) -> Shake ()
 (*>) pattern action = (compiled `match`) ?> action
