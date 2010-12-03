@@ -2,7 +2,8 @@
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
-    want, (*>), oracle,
+    (*>), (**>), (?>), addRule,
+    want, oracle,
     
     -- * The monadic interface used by rule bodies
     Act, need, query,
@@ -25,7 +26,6 @@ import Data.Either
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
-import Data.List
 
 import System.Directory
 import System.FilePath.Glob
@@ -35,11 +35,7 @@ import System.IO.Unsafe
 
 
 -- TODO: deal with "also" files
--- TODO: allow arbitrary rule predicates
-data Rule = R {
-    r_pattern :: Pattern,
-    r_action :: FilePath -> Act ()
-  }
+type Rule = FilePath -> Maybe (Act ())
 
 data ShakeState = SS {
     ss_rules :: [Rule],
@@ -62,6 +58,9 @@ getShakeState = Shake (lift State.get)
 
 putShakeState :: ShakeState -> Shake ()
 putShakeState s = Shake (lift (State.put s))
+
+modifyShakeState :: (ShakeState -> ShakeState) -> Shake ()
+modifyShakeState f = Shake (lift (State.modify f))
 
 askShakeEnv :: Shake ShakeEnv
 askShakeEnv = Shake Reader.ask
@@ -145,9 +144,17 @@ want fps = do
       putShakeState $ s { ss_database = as_database final_s }
 
 (*>) :: String -> (FilePath -> Act ()) -> Shake ()
-(*>) pattern action = do
-    s <- getShakeState
-    putShakeState $ s { ss_rules = R { r_pattern = compile pattern, r_action = action } : ss_rules s }
+(*>) pattern action = (compiled `match`) ?> action
+  where compiled = compile pattern
+
+(**>) :: (FilePath -> Maybe a) -> (FilePath -> a -> Act ()) -> Shake ()
+(**>) p action = addRule $ \fp -> p fp >>= \x -> return (action fp x)
+
+(?>) :: (FilePath -> Bool) -> (FilePath -> Act ()) -> Shake ()
+(?>) p action = addRule $ \fp -> guard (p fp) >> return (action fp)
+
+addRule :: Rule -> Shake ()
+addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 
 -- TODO: do subrules in parallel
 need :: [FilePath] -> Act ()
@@ -189,10 +196,10 @@ appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_hi
 runRule :: FilePath -> Act (History, ModTime)
 runRule fp = do
     e <- askActEnv
-    case [rule | rule <- ae_global_rules e, r_pattern rule `match` fp] of
-        [rule] -> do
+    case [action | rule <- ae_global_rules e, Just action <- [rule fp]] of
+        [action] -> do
             init_db <- fmap as_database getActState
-            ((), final_nested_s) <- liftIO $ runAct e (AS { as_this_history = [], as_database = init_db }) (r_action rule fp)
+            ((), final_nested_s) <- liftIO $ runAct e (AS { as_this_history = [], as_database = init_db }) action
             modifyActState $ \s -> s { as_database = as_database final_nested_s }
             
             nested_time <- fmap (expectJust $ "The matching rule did not create " ++ fp) $ liftIO $ getModTime fp
@@ -203,7 +210,7 @@ runRule fp = do
             case mb_nested_time of
                 Nothing          -> error $ "No rule to build " ++ fp
                 Just nested_time -> return ([], nested_time) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-        rules -> error $ "Ambiguous rules for " ++ fp ++ " (matched the patterns " ++ intercalate ", " (map (show . r_pattern) rules) ++ ")" -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
+        _sactions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
 type Answer = [String]
