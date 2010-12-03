@@ -12,7 +12,7 @@ import System.Directory
 import System.FilePath
 
 
-readFileLines :: FilePath -> Act [String]
+readFileLines :: Oracle o => FilePath -> Act o [String]
 readFileLines x = do
     need [x]
     liftIO $ fmap lines $ readFile x
@@ -20,11 +20,11 @@ readFileLines x = do
 quote :: String -> String
 quote x = "\"" ++ x ++ "\"" -- TODO: this is probably wrong
 
-copy :: FilePath -> FilePath -> Act ()
+copy :: Oracle o => FilePath -> FilePath -> Act o ()
 copy from to = do
     mkdir $ takeDirectory to
     need [from]
     system' ["cp", quote from, quote to]
 
-mkdir :: FilePath -> Act ()
+mkdir :: FilePath -> Act o ()
 mkdir fp = liftIO $ createDirectoryIfMissing True fp

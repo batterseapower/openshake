@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, TypeFamilies, FlexibleContexts, StandaloneDeriving #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -34,38 +34,44 @@ import System.Time (CalendarTime, toCalendarTime)
 import System.IO.Unsafe
 
 
-type CreatesFiles = [FilePath]
-type Rule = FilePath -> Maybe (CreatesFiles, Act ())
+readMaybe :: Read a => String -> Maybe a
+readMaybe xs = case reads xs of
+    [(x, "")] -> Just x
+    _         -> Nothing
 
-data ShakeState = SS {
-    ss_rules :: [Rule],
-    ss_database :: Database
+
+type CreatesFiles = [FilePath]
+type Rule o = FilePath -> Maybe (CreatesFiles, Act o ())
+
+data ShakeState o = SS {
+    ss_rules :: [Rule o],
+    ss_database :: Database o
   }
 
-data ShakeEnv = SE {
-    se_oracle :: Oracle
+data ShakeEnv o = SE {
+    se_oracle :: o
   }
 
 -- TODO: should Shake really be an IO monad?
-newtype Shake a = Shake { unShake :: Reader.ReaderT ShakeEnv (State.StateT ShakeState IO) a }
+newtype Shake o a = Shake { unShake :: Reader.ReaderT (ShakeEnv o) (State.StateT (ShakeState o) IO) a }
                 deriving (Functor, Applicative, Monad, MonadIO)
 
-runShake :: ShakeEnv -> ShakeState -> Shake a -> IO (a, ShakeState)
+runShake :: ShakeEnv o -> ShakeState o -> Shake o a -> IO (a, ShakeState o)
 runShake e s mx = State.runStateT (Reader.runReaderT (unShake mx) e) s
 
-getShakeState :: Shake ShakeState
+getShakeState :: Shake o (ShakeState o)
 getShakeState = Shake (lift State.get)
 
-putShakeState :: ShakeState -> Shake ()
+putShakeState :: ShakeState o -> Shake o ()
 putShakeState s = Shake (lift (State.put s))
 
-modifyShakeState :: (ShakeState -> ShakeState) -> Shake ()
+modifyShakeState :: (ShakeState o -> ShakeState o) -> Shake o ()
 modifyShakeState f = Shake (lift (State.modify f))
 
-askShakeEnv :: Shake ShakeEnv
+askShakeEnv :: Shake o (ShakeEnv o)
 askShakeEnv = Shake Reader.ask
 
-localShakeEnv :: (ShakeEnv -> ShakeEnv) -> Shake a -> Shake a
+localShakeEnv :: (ShakeEnv o -> ShakeEnv o) -> Shake o a -> Shake o a
 localShakeEnv f mx = Shake (Reader.local f (unShake mx))
 
 
@@ -75,67 +81,101 @@ getModTime :: FilePath -> IO (Maybe ModTime)
 getModTime fp = handleDoesNotExist (getModificationTime fp >>= toCalendarTime)
 
 
-type History = [QA]
-data QA = Oracle Question Answer
-        | Need [(FilePath, ModTime)]
-        deriving (Show, Read)
+type History o = [QA o]
+data QA o = Oracle (Question o) (Answer o)
+          | Need [(FilePath, ModTime)]
 
-type Database = Map FilePath Status
-data Status = Dirty History
-            | Clean History ModTime
-            deriving (Show, Read)
+deriving instance Oracle o => Show (QA o)
+deriving instance Oracle o => Read (QA o)
+
+{-
+instance Oracle o => Show (QA o) where
+    showsPrec prec (Oracle q a) = showParen (prec > 9) $ showString "Oracle " . showsPrec 10 q . showString " " . showsPrec 10 a
+    showsPrec prec (Need xes)   = showParen (prec > 9) $ showString "Need " . showsPrec 10 xes
+
+instance Read (QA o) where
+    readsPrec _prec s = do
+      (token, s) <- lex s
+      case token of
+          "Oracle" -> do
+              (q, s) <- readsPrec 10 s
+              (a, s) <- readsPrec 10 s
+              return (Oracle q a, s)
+          "Need" -> do
+              (xes, s) <- readsPrec 10 s
+              return (Need xes, s)
+-}
+
+type Database o = Map FilePath (Status o)
+data Status o = Dirty (History o)
+              | Clean (History o) ModTime
+              deriving (Show, Read)
 
 
-data ActState = AS {
-    as_this_history :: History,
-    as_database :: Database
+data ActState o = AS {
+    as_this_history :: History o,
+    as_database :: Database o
   }
 
-data ActEnv = AE {
-    ae_global_rules :: [Rule],
-    ae_global_oracle :: Oracle
+data ActEnv o = AE {
+    ae_global_rules :: [Rule o],
+    ae_global_oracle :: o
   }
 
-newtype Act a = Act { unAct :: Reader.ReaderT ActEnv (State.StateT ActState IO) a }
+newtype Act o a = Act { unAct :: Reader.ReaderT (ActEnv o) (State.StateT (ActState o) IO) a }
               deriving (Functor, Applicative, Monad, MonadIO)
 
-runAct :: ActEnv -> ActState -> Act a -> IO (a, ActState)
+runAct :: ActEnv o -> ActState o -> Act o a -> IO (a, ActState o)
 runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
 
-getActState :: Act ActState
+getActState :: Act o (ActState o)
 getActState = Act (lift State.get)
 
---putActState :: ActState -> Act ()
---putActState s = Act (lift (State.put s))
-
-modifyActState :: (ActState -> ActState) -> Act ()
+modifyActState :: (ActState o -> ActState o) -> Act o ()
 modifyActState f = Act (lift (State.modify f))
 
-askActEnv :: Act ActEnv
+askActEnv :: Act o (ActEnv o)
 askActEnv = Act Reader.ask
 
 
-shake :: Shake () -> IO ()
-shake mx = do
-    mb_db <- handleDoesNotExist (fmap read $ readFile ".openshake-db")
-    ((), final_s) <- runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_db }) mx
+shake :: Shake StringOracle () -> IO ()
+shake = shakeWithOracle defaultOracle
+
+shakeWithOracle :: Oracle o => o -> Shake o () -> IO ()
+shakeWithOracle orac mx = do
+    mb_s <- handleDoesNotExist (readFile ".openshake-db")
+    let mb_init_db = mb_s >>= readMaybe -- The database may not parse with a new oracle, so we will throw it away
+    unless (isJust mb_init_db) $ putStrLn "Database not present or unreadable: doing a full rebuild"
+    
+    ((), final_s) <- runShake (SE { se_oracle = orac }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_init_db }) mx
+    
     writeFile ".openshake-db" (show $ ss_database final_s)
+
+
+newtype StringOracle = SO { _unSO :: (String, String) -> [String] }
+
+instance Oracle StringOracle where
+    data Question StringOracle = SQ { _unSQ :: (String, String) }
+                               deriving (Show, Read, Eq)
+    data Answer StringOracle = SA { unSA :: [String] }
+                             deriving (Show, Read, Eq)
+    askOracle (SO o) (SQ q) = SA (o q)
+
+defaultOracle :: StringOracle
+defaultOracle = SO go
   where
+    -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
+    --go ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
+    go ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
+    go question     = error $ "The default oracle cannot answer the question " ++ show question
 
-
-defaultOracle :: Oracle
--- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
---default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
-defaultOracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
-defaultOracle question     = error $ "The default oracle cannot answer the question " ++ show question
-
-ls :: FilePath -> Act [FilePath]
-ls fp = query ("ls", fp)
+ls :: FilePath -> Act StringOracle [FilePath]
+ls fp = fmap unSA $ query $ SQ ("ls", fp)
 
 
 -- TODO: do files in parallel (Add "Building (MVar ())" constructor to the Database, and put Database into an MVar)
 -- TODO: Neil's example from his presentation only works if want doesn't actually build anything until the end (he wants before setting up any rules)
-want :: [FilePath] -> Shake ()
+want :: [FilePath] -> Shake o ()
 want fps = do
     e <- askShakeEnv
     forM_ fps $ \fp -> do
@@ -143,32 +183,32 @@ want fps = do
       (_time, final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_oracle = se_oracle e }) (AS { as_this_history = [], as_database = ss_database s }) (runRule fp)
       putShakeState $ s { ss_database = as_database final_s }
 
-(*>) :: String -> (FilePath -> Act ()) -> Shake ()
+(*>) :: String -> (FilePath -> Act o ()) -> Shake o ()
 (*>) pattern action = (compiled `match`) ?> action
   where compiled = compile pattern
 
-(*@>) :: (String, CreatesFiles) -> (FilePath -> Act ()) -> Shake ()
+(*@>) :: (String, CreatesFiles) -> (FilePath -> Act o ()) -> Shake o ()
 (*@>) (pattern, alsos) action = (\fp -> guard (compiled `match` fp) >> return alsos) ?@> action
   where compiled = compile pattern
 
-(**>) :: (FilePath -> Maybe a) -> (FilePath -> a -> Act ()) -> Shake ()
+(**>) :: (FilePath -> Maybe a) -> (FilePath -> a -> Act o ()) -> Shake o ()
 (**>) p action = addRule $ \fp -> p fp >>= \x -> return ([fp], action fp x)
 
-(**@>) :: (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act ()) -> Shake ()
+(**@>) :: (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act o ()) -> Shake o ()
 (**@>) p action = addRule $ \fp -> p fp >>= \(creates, x) -> return (creates, action fp x)
 
-(?>) :: (FilePath -> Bool) -> (FilePath -> Act ()) -> Shake ()
+(?>) :: (FilePath -> Bool) -> (FilePath -> Act o ()) -> Shake o ()
 (?>) p action = addRule $ \fp -> guard (p fp) >> return ([fp], action fp)
 
-(?@>) :: (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act ()) -> Shake ()
+(?@>) :: (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act o ()) -> Shake o ()
 (?@>) p action = addRule $ \fp -> p fp >>= \creates -> return (creates, action fp)
 
 
-addRule :: Rule -> Shake ()
+addRule :: Rule o -> Shake o ()
 addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 
 -- TODO: do subrules in parallel
-need :: [FilePath] -> Act ()
+need :: Oracle o => [FilePath] -> Act o ()
 need fps = do
     init_db <- fmap as_database getActState
     let (uncleans, cleans) = partitionEithers $
@@ -204,14 +244,14 @@ need fps = do
     
     appendHistory $ Need (unclean_times ++ clean_times)
 
-markClean :: FilePath -> History -> ModTime -> Act ()
+markClean :: FilePath -> History o -> ModTime -> Act o ()
 markClean fp nested_hist nested_time = modifyActState $ \s -> s { as_database = M.insert fp (Clean nested_hist nested_time) (as_database s) }
 
-appendHistory :: QA -> Act ()
+appendHistory :: QA o -> Act o ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when runRule returns, the input file will be clean (and probably some others, too..)
-runRule :: FilePath -> Act ModTime
+runRule :: FilePath -> Act o ModTime
 runRule fp = do
     e <- askActEnv
     case [(creates_fps, action) | rule <- ae_global_rules e, Just (creates_fps, action) <- [rule fp]] of
@@ -235,20 +275,23 @@ runRule fp = do
                   return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
         _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
-type Question = (String,String)
-type Answer = [String]
-type Oracle = Question -> Answer
+class (Show (Question o), Show (Answer o), Read (Question o), Read (Answer o), Eq (Question o), Eq (Answer o)) => Oracle o where
+    data Question o
+    data Answer o
+    askOracle :: o -> Question o -> Answer o
+    --packQA :: Question o -> Answer o -> QA
 
-oracle :: Oracle -> Shake a -> Shake a
+-- TODO: allow the type of the oracle to change?
+oracle :: Oracle o => o -> Shake o a -> Shake o a
 oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: some way to combine with previous oracle?
 
 -- | Like 'query', but doesn't record that the question was asked
-unsafeQuery :: Question -> Act Answer
+unsafeQuery :: Oracle o => Question o -> Act o (Answer o)
 unsafeQuery question = do
     e <- askActEnv
-    return $ ae_global_oracle e question
+    return $ askOracle (ae_global_oracle e) question
 
-query :: Question -> Act Answer
+query :: Oracle o => Question o -> Act o (Answer o)
 query question = do
     answer <- unsafeQuery question
     appendHistory $ Oracle question answer
