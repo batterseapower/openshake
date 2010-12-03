@@ -88,24 +88,6 @@ data QA o = Oracle (Question o) (Answer o)
 deriving instance Oracle o => Show (QA o)
 deriving instance Oracle o => Read (QA o)
 
-{-
-instance Oracle o => Show (QA o) where
-    showsPrec prec (Oracle q a) = showParen (prec > 9) $ showString "Oracle " . showsPrec 10 q . showString " " . showsPrec 10 a
-    showsPrec prec (Need xes)   = showParen (prec > 9) $ showString "Need " . showsPrec 10 xes
-
-instance Read (QA o) where
-    readsPrec _prec s = do
-      (token, s) <- lex s
-      case token of
-          "Oracle" -> do
-              (q, s) <- readsPrec 10 s
-              (a, s) <- readsPrec 10 s
-              return (Oracle q a, s)
-          "Need" -> do
-              (xes, s) <- readsPrec 10 s
-              return (Need xes, s)
--}
-
 type Database o = Map FilePath (Status o)
 data Status o = Dirty (History o)
               | Clean (History o) ModTime
