@@ -16,6 +16,8 @@ import Development.Shake.Utilities
 
 import Control.Applicative (Applicative)
 
+import Control.Concurrent.ParallelIO.Global
+
 import Control.Monad
 import qualified Control.Monad.Trans.Reader as Reader
 import qualified Control.Monad.Trans.State as State
@@ -115,12 +117,13 @@ askActEnv :: Act ActEnv
 askActEnv = Act Reader.ask
 
 
+-- NB: you can only use shake once per program run
 shake :: Shake () -> IO ()
 shake mx = do
     mb_db <- handleDoesNotExist (fmap read $ readFile ".openshake-db")
     ((), final_s) <- runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_db }) mx
     writeFile ".openshake-db" (show $ ss_database final_s)
-  where
+    stopGlobalPool
 
 
 defaultOracle :: Oracle
