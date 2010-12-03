@@ -1,8 +1,19 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-import Control.Applicative (Applicative)
-import Control.Arrow (first)
+module Development.Shake (
+    -- * The top-level monadic interface
+    Shake, shake,
+    want, (*>), oracle,
+    
+    -- * The monadic interface used by rule bodies
+    Act, need, query,
+    
+    -- * Oracles, the default oracle and wrappers for the questions it can answer
+    Oracle, Question, Answer, defaultOracle, ls
+  ) where
 
-import qualified Control.Exception as Exception
+import Development.Shake.Utilities
+
+import Control.Applicative (Applicative)
 
 import Control.Monad
 import qualified Control.Monad.Trans.Reader as Reader
@@ -10,7 +21,6 @@ import qualified Control.Monad.Trans.State as State
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class
 
-import Data.Char
 import Data.Either
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -18,39 +28,14 @@ import Data.Maybe
 import Data.List
 
 import System.Directory
-import System.FilePath
 import System.FilePath.Glob
 import System.Time (CalendarTime, toCalendarTime)
 
-import qualified System.Process as Process
-import System.Exit
-
-import System.IO
-import System.IO.Error (isDoesNotExistError)
 import System.IO.Unsafe
-import System.IO.Temp
 
 
-handleDoesNotExist :: IO a -> IO (Maybe a)
-handleDoesNotExist act = Exception.handleJust (guard . isDoesNotExistError) (\() -> return Nothing) (fmap Just act)
-
-expectJust :: String -> Maybe a -> a
-expectJust _   (Just x) = x
-expectJust msg Nothing  = error $ "expectJust: " ++ msg
-
-anyM :: Monad m => (a -> m Bool) -> [a] -> m Bool
-anyM p = go
-  where go []     = return False
-        go (x:xs) = do
-            b <- p x
-            if b then return True
-                 else go xs
-
-(?) :: Bool -> (a, a) -> a
-True  ? (t, _) = t
-False ? (_, f) = f
-
-
+-- TODO: deal with "also" files
+-- TODO: allow arbitrary rule predicates
 data Rule = R {
     r_pattern :: Pattern,
     r_action :: FilePath -> Act ()
@@ -121,8 +106,8 @@ runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
 getActState :: Act ActState
 getActState = Act (lift State.get)
 
-putActState :: ActState -> Act ()
-putActState s = Act (lift (State.put s))
+--putActState :: ActState -> Act ()
+--putActState s = Act (lift (State.put s))
 
 modifyActState :: (ActState -> ActState) -> Act ()
 modifyActState f = Act (lift (State.modify f))
@@ -134,13 +119,16 @@ askActEnv = Act Reader.ask
 shake :: Shake () -> IO ()
 shake mx = do
     mb_db <- handleDoesNotExist (fmap read $ readFile ".openshake-db")
-    ((), final_s) <- runShake (SE { se_oracle = default_oracle }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_db }) mx
+    ((), final_s) <- runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_database = fromMaybe M.empty mb_db }) mx
     writeFile ".openshake-db" (show $ ss_database final_s)
   where
-    -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
-    --default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
-    default_oracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
-    default_oracle question     = error $ "The default oracle cannot answer the question " ++ show question
+
+
+defaultOracle :: Oracle
+-- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
+--default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
+defaultOracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
+defaultOracle question     = error $ "The default oracle cannot answer the question " ++ show question
 
 ls :: FilePath -> Act [FilePath]
 ls fp = query ("ls", fp)
@@ -175,7 +163,7 @@ need fps = do
     let history_requires_rerun (Oracle question old_answer) = do
             new_answer <- unsafeQuery question
             return (old_answer /= new_answer)
-        history_requires_rerun (Need fps) = flip anyM fps $ \(fp, old_time) -> do
+        history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
             new_time <- liftIO $ getModTime fp
             return (Just old_time /= new_time)
     
@@ -222,7 +210,7 @@ type Answer = [String]
 type Oracle = Question -> Answer
 
 oracle :: Oracle -> Shake a -> Shake a
-oracle oracle = localShakeEnv (\e -> e { se_oracle = oracle }) -- TODO: some way to combine with previous oracle?
+oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: some way to combine with previous oracle?
 
 -- | Like 'query', but doesn't record that the question was asked
 unsafeQuery :: Question -> Act Answer
@@ -235,69 +223,3 @@ query question = do
     answer <- unsafeQuery question
     appendHistory $ Oracle question answer
     return answer
-
-
-checkExitCode :: (Show a, Monad m) => a -> ExitCode -> m ()
-checkExitCode cmd ec = case ec of
-    ExitSuccess   -> return ()
-    ExitFailure i -> error $ "system': system command " ++ show cmd ++ " failed with exit code " ++ show i
-
-system' :: MonadIO m => [String] -> m ()
-system' prog = do
-    ec <- system prog
-    checkExitCode prog ec
-
-system :: MonadIO m => [String] -> m ExitCode
-system prog = liftIO $ Process.system $ intercalate " " prog
-
-systemStdout' :: MonadIO m => [String] -> m String
-systemStdout' prog = liftIO $ withSystemTempDirectory "openshake" $ \tmpdir -> do
-    let stdout_fp = tmpdir </> "stdout" <.> "txt"
-    ec <- Process.system $ intercalate " " prog ++ " > " ++ stdout_fp
-    checkExitCode prog ec
-    readFile stdout_fp
-
-
--- Example build system
-
-readFileLines :: FilePath -> Act [String]
-readFileLines x = do
-    need [x]
-    liftIO $ fmap lines $ readFile x
-
-quote :: String -> String
-quote x = "\"" ++ x ++ "\"" -- TODO: this is probably wrong
-
-copy :: FilePath -> FilePath -> Act ()
-copy from to = do
-    mkdir $ takeDirectory to
-    need [from]
-    system' ["cp", quote from, quote to]
-
-mkdir :: FilePath -> Act ()
-mkdir fp = liftIO $ createDirectoryIfMissing True fp
-
-cIncludes :: FilePath -> Act [FilePath]
-cIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
-  where
-    -- TODO: should probably do better than this quick and dirty hack
-    -- FIXME: transitive dependencies
-    trim p = dropWhile p . reverse . dropWhile p . reverse
-    takeInclude xs = guard ("#include" `isPrefixOf` map toLower xs) >> stripQuotes (trim isSpace (drop (length "#include") xs))
-    stripQuotes ('\"':xs) = guard (not (null xs) && last xs == '\"') >> return (init xs)
-    stripQuotes _ = Nothing
-
-main :: IO ()
-main = shake $ do
-    "Main" *> \x -> do
-        cs <- ls "*.c"
-        let os = map (`replaceExtension` "o") cs
-        need os
-        system' $ ["gcc","-o",x] ++ os
-    "*.o" *> \x -> do
-        let c = replaceExtension x "c"
-        need [c]
-        need =<< cIncludes c
-        system' ["gcc","-c",c,"-o",x]
-    want ["Main"]
-        

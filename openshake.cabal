@@ -1,0 +1,22 @@
+Name:                openshake
+Version:             0.1
+Cabal-Version:       >= 1.2
+Category:            Distribution
+Synopsis:            Powerful and easy to use build system: open source implementation of Neil Mitchell's Shake system
+Description:         A library for constructing build systems, using Haskell as a powerful domain specific language
+                     for specifying rules.
+                     
+                     The best reference for how it works at the moment is Neil's presentation to the Haskell Implementors
+                     Workshop 2010 at <http://community.haskell.org/~ndm/downloads/slides-shake_a_better_make-01_oct_2010.pdf>
+License:             BSD3
+License-File:        LICENSE
+Author:              Max Bolingbroke <batterseapower@hotmail.com>
+Maintainer:          Max Bolingbroke <batterseapower@hotmail.com>
+Homepage:            http://www.github.com/batterseapower/openshake
+Build-Type:          Simple
+
+Library
+        Exposed-Modules:        Development.Shake
+                                Development.Shake.C
+                                Development.Shake.System
+        Other-Modules:          Development.Shake.Utilities
