@@ -3,12 +3,9 @@ module Development.Shake.Utilities where
 import qualified Control.Exception as Exception
 
 import Control.Monad
-import Control.Monad.IO.Class
 
-import Data.List
-
-import qualified System.Process as Process
 import System.Exit
+import qualified System.Process as Process
 
 import System.FilePath
 import System.IO.Error (isDoesNotExistError)
@@ -59,17 +56,14 @@ checkExitCode cmd ec = case ec of
     ExitSuccess   -> return ()
     ExitFailure i -> error $ "system': system command " ++ show cmd ++ " failed with exit code " ++ show i
 
-system' :: MonadIO m => [String] -> m ()
-system' prog = do
-    ec <- system prog
-    checkExitCode prog ec
-
-system :: MonadIO m => [String] -> m ExitCode
-system prog = liftIO $ Process.system $ intercalate " " prog
-
-systemStdout' :: MonadIO m => [String] -> m String
-systemStdout' prog = liftIO $ withSystemTempDirectory "openshake" $ \tmpdir -> do
+systemStdout :: String -> IO (ExitCode, String)
+systemStdout cmd = withSystemTempDirectory "openshake" $ \tmpdir -> do
     let stdout_fp = tmpdir </> "stdout" <.> "txt"
-    ec <- Process.system $ intercalate " " prog ++ " > " ++ stdout_fp
-    checkExitCode prog ec
-    readFile stdout_fp
+    ec <- Process.system $ cmd ++ " > " ++ stdout_fp
+    fmap ((,) ec) $ readFile stdout_fp
+
+systemStdout' :: String -> IO String
+systemStdout' cmd = do
+    (ec, stdout) <- systemStdout cmd
+    checkExitCode cmd ec
+    return stdout

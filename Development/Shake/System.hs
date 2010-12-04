@@ -4,12 +4,41 @@ module Development.Shake.System (
   ) where
 
 import Development.Shake
-import Development.Shake.Utilities
+import qualified Development.Shake.Utilities as Utilities
 
 import Control.Monad.IO.Class
 
+import Data.List
+
+import qualified System.Process as Process
+import System.Exit
+
 import System.Directory
 import System.FilePath
+
+
+system' :: [String] -> Act ()
+system' prog = do
+    ec <- system prog
+    Utilities.checkExitCode prog ec
+
+system :: [String] -> Act ExitCode
+system prog = do
+    putStrLnAt VerboseVerbosity cmd
+    liftIO $ Process.system cmd
+  where cmd = intercalate " " prog
+
+systemStdout' :: [String] -> Act String
+systemStdout' prog = do
+    (ec, stdout) <- systemStdout prog
+    Utilities.checkExitCode prog ec
+    return stdout
+
+systemStdout :: [String] -> Act (ExitCode, String)
+systemStdout prog = do
+    putStrLnAt VerboseVerbosity cmd
+    liftIO $ Utilities.systemStdout cmd
+  where cmd = intercalate " " prog
 
 
 readFileLines :: FilePath -> Act [String]

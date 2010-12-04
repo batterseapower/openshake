@@ -5,6 +5,9 @@ module Development.Shake (
     Rule, CreatesFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
     want, oracle,
     
+    -- * Verbosity and command-line output from Shake
+    Verbosity(..), actVerbosity, putStrLnAt,
+    
     -- * The monadic interface used by rule bodies
     Act, need, query,
     
@@ -37,14 +40,27 @@ import Control.Monad.IO.Class
 import Data.Either
 import Data.Map (Map)
 import qualified Data.Map as M
+import Data.Maybe
 
 import System.Directory
+import System.Environment
 import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
 import System.IO.Unsafe
 
 import GHC.Conc (numCapabilities)
+
+
+-- | Verbosity level: higher is more verbose. Levels are as follows:
+--
+-- 0: Silent
+-- 1: Quiet
+-- 2: Normal
+-- 3: Verbose
+-- 4: Chatty
+data Verbosity = SilentVerbosity | QuietVerbosity | NormalVerbosity | VerboseVerbosity | ChattyVerbosity
+               deriving (Enum, Bounded, Eq, Ord)
 
 
 type CreatesFiles = [FilePath]
@@ -57,7 +73,8 @@ data ShakeState = SS {
 data ShakeEnv = SE {
     se_database :: Database,
     se_pool :: Pool,
-    se_oracle :: Oracle
+    se_oracle :: Oracle,
+    se_verbosity :: Verbosity
   }
 
 -- TODO: should Shake really be an IO monad?
@@ -202,21 +219,39 @@ modifyActState f = Act (lift (State.modify f))
 askActEnv :: Act ActEnv
 askActEnv = Act Reader.ask
 
+actVerbosity :: Act Verbosity
+actVerbosity = fmap (se_verbosity . ae_global_env) askActEnv 
+
+putStrLnAt :: Verbosity -> String -> Act ()
+putStrLnAt at_verbosity msg = do
+    verbosity <- actVerbosity
+    liftIO $ when (verbosity >= at_verbosity) $ putStrLn msg
+
 
 -- NB: you can only use shake once per program run
 shake :: Shake () -> IO ()
 shake mx = withPool numCapabilities $ \pool -> do
+    -- TODO: when we have more command line options, use a proper command line argument parser.
+    -- We should also work out whether shake should be doing argument parsing at all, given that it's
+    -- meant to be used as a library function...
+    verbosity <- fmap (\args -> fromMaybe NormalVerbosity $ listToMaybe $ reverse [ case rest of ""  -> VerboseVerbosity
+                                                                                                 "v" -> ChattyVerbosity
+                                                                                                 _   -> toEnum (fromEnum (minBound :: Verbosity) `max` read rest `min` fromEnum (maxBound :: Verbosity))
+                                                                                  | '-':'v':rest <- args ]) getArgs
+    
     mb_bs <- handleDoesNotExist (return Nothing) $ fmap Just $ BS.readFile ".openshake-db"
     db <- case mb_bs of
-        Nothing -> putStrLn "Database did not exist, doing full rebuild" >> return M.empty
+        Nothing -> do
+            when (verbosity >= NormalVerbosity) $ putStrLn "Database did not exist, doing full rebuild"
+            return M.empty
          -- NB: we force the input ByteString because we really want the database file to be closed promptly
         Just bs -> length (BS.unpack bs) `seq` (Exception.evaluate (rnf db) >> return db) `Exception.catch` \(Exception.ErrorCall reason) -> do
-                      putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
-                      return M.empty
+            when (verbosity >= NormalVerbosity) $ putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
+            return M.empty
           where db = runGet getPureDatabase bs
     db_mvar <- newMVar db
     
-    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_pool = pool, se_oracle = defaultOracle }) (SS { ss_rules = [] }) mx
+    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -225,7 +260,7 @@ shake mx = withPool numCapabilities $ \pool -> do
 defaultOracle :: Oracle
 -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
 --default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
-defaultOracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ["ls", what]
+defaultOracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ("ls " ++ what)
 defaultOracle question     = error $ "The default oracle cannot answer the question " ++ show question
 
 ls :: FilePath -> Act [FilePath]
