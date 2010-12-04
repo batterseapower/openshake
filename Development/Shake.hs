@@ -303,6 +303,9 @@ need :: [FilePath] -> Act ()
 need fps = do
     e <- askActEnv
     
+    -- FIXME: handling of also files is not right: we should mark also files as Building
+    -- while we are building something that will yield them!
+    
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
     (cleans, uncleans) <- liftIO $ modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
