@@ -274,7 +274,7 @@ need fps = do
               [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
                                            Just (Dirty hist)           -> Left (fp, Just hist)
                                            Just (Clean _ _)            -> Right (fp, Nothing)
-                                           Just (Building _ wait_mvar) -> Right (fp, Just wait_mvar)
+                                           Just (Building _ wait_mvar) -> Right (fp, Just wait_mvar) -- TODO: detect dependency cycles through Building
               | fp <- fps
               ]
         db <- (\f -> foldM f init_db uncleans) $ \db (unclean_fp, mb_hist) -> do
