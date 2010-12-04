@@ -25,7 +25,6 @@ import qualified Data.ByteString.Lazy as BS
 import qualified Codec.Binary.UTF8.String as UTF8
 
 import Control.Applicative (Applicative)
-import Control.Arrow (first, second)
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -327,102 +326,118 @@ need fps = do
     e <- askActEnv
     need_times <- liftIO $ need' e fps
     appendHistory $ Need need_times
-    
+
+withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
+withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -> return (x', y)
+
 need' :: ActEnv -> [FilePath] -> IO [(FilePath, ModTime)]
 need' e init_fps = do
     let verbosity = se_verbosity (ae_global_env e)
+        db_mvar = se_database (ae_global_env e)
         get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
-    -- NB: this MVar operation does not block us because any thread only holds the database lock
-    -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
-    (cleans, uncleans_cleaned_rules) <- modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
-        let -- We assume that the rules do not change to include new dependencies often: this lets
-            -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
-            -- of the rule have not changed
-            history_requires_rerun :: QA -> IO (Maybe String)
-            history_requires_rerun (Oracle question old_answer) = do
-                let new_answer = se_oracle (ae_global_env e) question
-                return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-            history_requires_rerun (Need nested_fps_times) = do
-                let (nested_fps, nested_old_times) = unzip nested_fps_times
-                -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
-                -- so we recursively invoke need in order to check if we have any changes
-                -- TODO: we might get infinite recursion here
-                -- FIXME: I'm invoking need' while holding the lock!!
-                nested_new_times <- need' e nested_fps
-                let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
-                return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
-                    \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
-
-            find_all_rules [] = return ([], [])
-            find_all_rules (fp:fps) = do
-                let ei_unclean_clean = case M.lookup fp init_db of
-                      Nothing                     -> Left Nothing
-                      Just (Dirty hist)           -> Left (Just hist)
-                      Just (Clean _ _)            -> Right Nothing
-                      Just (Building _ wait_mvar) -> Right (Just wait_mvar) -- TODO: detect dependency cycles through Building
-                case ei_unclean_clean of
-                    Right mb_mvar -> 
-                      fmap (first ((fp, mb_mvar) :)) $ find_all_rules fps
-                    Left mb_hist -> do
-                      mb_clean_hist <- do
-                          ei_clean_hist_dirty_reason <- case mb_hist of Nothing   -> return (Right "file was not in the database")
-                                                                        Just hist -> fmap (maybe (Left hist) Right) $ firstJustM $ map history_requires_rerun hist
-                          case ei_clean_hist_dirty_reason of
-                            Left clean_hist -> return (Just clean_hist)
-                            Right dirty_reason -> do
-                              when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ fp ++ " because " ++ dirty_reason
-                              return Nothing
-                      (creates_fps, rule) <- case mb_clean_hist of
-                        Nothing         -> findRule (ae_global_rules e) fp
-                        Just clean_hist -> return ([fp], \_ -> do
+    let -- We assume that the rules do not change to include new dependencies often: this lets
+        -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
+        -- of the rule have not changed
+        history_requires_rerun :: QA -> IO (Maybe String)
+        history_requires_rerun (Oracle question old_answer) = do
+            let new_answer = se_oracle (ae_global_env e) question
+            return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
+        history_requires_rerun (Need nested_fps_times) = do
+            let (nested_fps, nested_old_times) = unzip nested_fps_times
+            -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
+            -- so we recursively invoke need in order to check if we have any changes
+            -- TODO: we might get infinite recursion here
+            nested_new_times <- need' e nested_fps
+            let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
+            return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
+                \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
+    
+        find_all_rules pending_cleans pending_uncleans [] db = do
+            -- Display a helpful message to the user explaining the rules that we have decided upon:
+            let all_creates_fps = [creates_fp | (_, creates_fps, _) <- pending_uncleans, creates_fp <- creates_fps]
+            when (not (null pending_uncleans) && verbosity >= ChattyVerbosity) $
+                putStrLn $ "Using " ++ show (length pending_uncleans) ++ " rule instances to create the " ++
+                           show (length all_creates_fps) ++ " files (" ++ showStringList all_creates_fps ++ ")"
+            
+            -- The rule-running code doesn't need to know *all* the files created by a rule run
+            return (db, (pending_cleans, [(unclean_fps, rule) | (unclean_fps, _, rule) <- pending_uncleans]))
+        find_all_rules pending_cleans pending_uncleans (fp:fps) db = do
+            let ei_unclean_clean = case M.lookup fp db of
+                  Nothing                     -> Left Nothing
+                  Just (Dirty hist)           -> Left (Just hist)
+                  Just (Clean _ _)            -> Right Nothing
+                  Just (Building _ wait_mvar) -> Right (Just wait_mvar) -- TODO: detect dependency cycles through Building
+            
+            case ei_unclean_clean of
+                Right mb_mvar -> find_all_rules ((fp, mb_mvar) : pending_cleans) pending_uncleans fps db
+                Left mb_hist -> do
+                  -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
+                  -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
+                  (potential_creates_fps, potential_rule) <- findRule (ae_global_rules e) fp
+    
+                  -- 1) Basic sanity check that the rule creates the file we actually need
+                  unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ fp ++ " but claims not to create it, only the files " ++ showStringList potential_creates_fps
+    
+                  -- 2) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
+                  --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
+                  --    use (read or write) by another builder process.
+                  let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp db of Nothing -> False; Just (Dirty _) -> False; _ -> True) potential_creates_fps
+                  unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList potential_creates_fps ++ " in the process of building " ++ fp ++
+                                                                 ", but the files " ++ showStringList non_dirty_fps ++ " have been independently built by someone else"
+    
+                  -- NB: we have to find the rule and mark the things it may create as Building *before* we determine whether the
+                  -- file is actually dirty according to its history. This is because if the file *is* dirty according to that history
+                  -- then we want to prevent any recursive invocations of need from trying to Build some file that we have added a
+                  -- pending_unclean entry for already
+                  --
+                  -- NB: people wanting *any* of the files created by this rule should wait on the same WaitHandle
+                  wait_handle <- newWaitHandle
+                  db <- return $ foldr (\potential_creates_fp db -> M.insert potential_creates_fp (Building mb_hist wait_handle) db) db potential_creates_fps
+    
+                  (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
+                                                                      Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map history_requires_rerun hist
+                  mb_clean_hist <- case ei_clean_hist_dirty_reason of
+                    Left clean_hist -> return (Just clean_hist)
+                    Right dirty_reason -> do
+                      when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ fp ++ " because " ++ dirty_reason
+                      return Nothing
+                  
+                  let (creates_fps, basic_rule) = case mb_clean_hist of
+                        Nothing         -> (potential_creates_fps, potential_rule e)
+                        Just clean_hist -> ([fp], do
                           nested_time <- get_clean_mod_time fp
                           return (clean_hist, [(fp, nested_time)]))
-                
-                      -- 0) Basic sanity check that the rule creates the file we actually need
-                      unless (fp `elem` creates_fps) $ shakefileError $ "A rule matched " ++ fp ++ " but claims not to create it, only the files " ++ showStringList creates_fps
-                
-                      -- 1) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
-                      --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
-                      --    use (read or write) by another builder process.
-                      let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp init_db of Nothing -> False; Just (Dirty _) -> False; _ -> True) creates_fps
-                      unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList creates_fps ++ " in the process of building " ++ fp ++
-                                                                     ", but the files " ++ showStringList non_dirty_fps ++ " have been independently built by someone else"
-                
-                      -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
-                      --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
-                      let (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
-                      fmap (second ((fp : next_fps_satisifed_here, mb_hist, creates_fps, rule) :)) $ find_all_rules fps'
-        
-        -- Figure out the rules we need to use to create all the dirty files we need
-        (cleans, uncleans_rules) <- find_all_rules init_fps
-        let all_creates_fps = [creates_fp | (_, _, creates_fps, _) <- uncleans_rules, creates_fp <- creates_fps]
-        when (not (null uncleans_rules) && verbosity >= ChattyVerbosity) $
-            putStrLn $ "Using " ++ show (length uncleans_rules) ++ " rule instances to create " ++
-                       show (length all_creates_fps) ++ " files (" ++ showStringList all_creates_fps ++ ")"
-        
-        -- Build the updated database that reflects the files that are going to be Building, and augment
-        -- the rule so that when it is run it sets all of the things it built to Clean again
-        (db, uncleans_cleaned_rules) <- (\f -> mapAccumLM f init_db uncleans_rules) $ \db (unclean_fps, mb_hist, creates_fps, rule) -> do
-            -- People wanting any of the files created by this rule should wait on the same MVar
-            wait_handle <- newWaitHandle
-            return (foldr (\creates_fp -> M.insert creates_fp (Building mb_hist wait_handle)) db creates_fps,
-                   (unclean_fps, do { (nested_hist, mtimes) <- rule e;
-                                      -- This is where we mark all of the files created by the rule as Clean:
-                                      markCleans (se_database (ae_global_env e)) nested_hist creates_fps mtimes;
-                                      -- Wake up all of the waiters on the old Building entry (if any)
-                                      awakeWaiters wait_handle;
-                                      return mtimes }))
-        
-        return (db, (cleans, uncleans_cleaned_rules))
+                      
+                      -- Augment the rule so that when it is run it sets all of the things it built to Clean again
+                      rule = do
+                          (nested_hist, mtimes) <- basic_rule
+                          -- This is where we mark all of the files created by the rule as Clean:
+                          markCleans (se_database (ae_global_env e)) nested_hist creates_fps mtimes
+                          -- Wake up all of the waiters on the old Building entry (if any)
+                          awakeWaiters wait_handle
+                          return mtimes
+    
+                  -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
+                  --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
+                  let (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
+                  find_all_rules pending_cleans ((fp : next_fps_satisifed_here, creates_fps, rule) : pending_uncleans) fps' db
+    
+    -- Figure out the rules we need to use to create all the dirty files we need
+    --
+    -- NB: this MVar operation does not block us because any thread only holds the database lock
+    -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff).
+    -- When we have to recursively invoke need, we put back into the MVar before doing so.
+    (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps
     
     -- Run the rules we have decided upon in parallel
-    unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans_cleaned_rules $ \(unclean_fps, rule) -> do
+    unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
         return $ snd $ lookupMany (\unclean_fp -> internalError $ "We should have reported the modification time for the rule file " ++ unclean_fp) unclean_fps mtimes
     
+    -- TODO: could communicate ModTime of clean file via the WaitHandle... more elegant?
     clean_times <- forM cleans $ \(clean_fp, mb_wait_handle) -> do
         case mb_wait_handle of
           Nothing -> return ()
