@@ -156,6 +156,9 @@ prepareStatus (Building mb_hist _) = mb_hist
 prepareStatus (Dirty hist)         = Just hist
 prepareStatus (Clean hist _ )      = Just hist
 
+-- NB: use of the Clean constructor is just an optimisation that means we don't have to recursively recheck dependencies
+-- whenever a file is need -- instead we can cut the checking process off if we discover than a file is marked as Clean.
+-- Of course, this might go a bit wrong if the file becomes invalidated *during a Shake run*, but we accept that risk.
 data Status = Dirty History
             | Clean History ModTime
             | Building (Maybe History) WaitHandle
