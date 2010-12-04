@@ -274,7 +274,7 @@ shake mx = withPool numCapabilities $ \pool -> do
             return M.empty
           where db = runGet getPureDatabase bs
     
-    when (verbosity >= ChattyVerbosity) $ putStrLn $ "Initial database:\n" ++ show db
+    when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
     ((), _final_s) <- runShake (SE { se_database = db_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
@@ -330,7 +330,7 @@ need fps = do
     e <- askActEnv
     verbosity <- actVerbosity
     
-    let get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
+    let get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
@@ -364,7 +364,7 @@ need fps = do
                 (creates_fps, rule) <- case mb_clean_hist of
                   Nothing         -> findRule (ae_global_rules e) unclean_fp
                   Just clean_hist -> return ([unclean_fp], \_ -> do
-                    nested_time <-  get_clean_mod_time unclean_fp
+                    nested_time <- get_clean_mod_time unclean_fp
                     return (clean_hist, [(unclean_fp, nested_time)]))
                 
                 -- 0) Basic sanity check that the rule creates the file we actually need
@@ -384,6 +384,11 @@ need fps = do
         
         -- Figure out the rules we need to use to create all the dirty files we need
         uncleans_rules <- find_all_rules init_uncleans
+        let all_creates_fps = [creates_fp | (_, _, creates_fps, _) <- uncleans_rules, creates_fp <- creates_fps]
+        when (not (null uncleans_rules) && verbosity >= ChattyVerbosity) $
+            putStrLn $ "Using " ++ show (length uncleans_rules) ++ " rule instances to create " ++
+                       show (length all_creates_fps) ++ " files (" ++ showStringList all_creates_fps ++
+                       "), including the unclean files " ++ showStringList (map fst init_uncleans)
         
         -- Build the updated database that reflects the files that are going to be Building, and augment
         -- the rule so that when it is run it sets all of the things it built to Clean again
