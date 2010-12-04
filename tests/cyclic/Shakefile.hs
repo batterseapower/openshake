@@ -1,8 +1,4 @@
 import Development.Shake
-import Development.Shake.C
-import Development.Shake.System
-
-import System.FilePath
 
 
 main :: IO ()
