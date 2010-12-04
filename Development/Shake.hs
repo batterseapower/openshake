@@ -248,7 +248,8 @@ putStrLnAt at_verbosity msg = do
     liftIO $ when (verbosity >= at_verbosity) $ putStrLn msg
 
 
--- NB: you can only use shake once per program run
+-- NB: if you use shake in a nested way bad things will happen to parallelism
+-- TODO: make parallelism configurable?
 shake :: Shake () -> IO ()
 shake mx = withPool numCapabilities $ \pool -> do
     -- TODO: when we have more command line options, use a proper command line argument parser.
