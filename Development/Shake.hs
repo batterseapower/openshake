@@ -38,9 +38,12 @@ import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class
 
 import Data.Either
+-- import Data.Set (Set)
+-- import qualified Data.Set as S
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
+import Data.List
 
 import System.Directory
 import System.Environment
@@ -61,6 +64,23 @@ import GHC.Conc (numCapabilities)
 -- 4: Chatty
 data Verbosity = SilentVerbosity | QuietVerbosity | NormalVerbosity | VerboseVerbosity | ChattyVerbosity
                deriving (Enum, Bounded, Eq, Ord)
+
+
+snocView :: [a] -> Maybe ([a], a)
+snocView [] = Nothing
+snocView ss = Just (init ss, last ss)
+
+showStringList :: [String] -> String
+showStringList ss = case snocView ss of
+    Nothing       -> ""
+    Just ([],  s) -> s
+    Just (ss', s) -> intercalate ", " ss' ++ " and " ++ s
+
+shakefileError :: String -> a
+shakefileError s = error $ "Your Shakefile contained an error: " ++ s
+
+internalError :: String -> a
+internalError s = error $ "Internal Shake error: " ++ s
 
 
 type CreatesFiles = [FilePath]
@@ -145,10 +165,10 @@ instance Binary Status where
         case tag of
           0 -> liftM Dirty getHistory
           1 -> liftM2 Clean getHistory getModTime
-          _ -> error $ "get{Status}: unknown tag " ++ show tag
+          _ -> internalError $ "get{Status}: unknown tag " ++ show tag
     put (Dirty hist)       = putWord8 0 >> putHistory hist
     put (Clean hist mtime) = putWord8 1 >> putHistory hist >> putModTime mtime
-    put (Building _ _) = error "Cannot serialize the Building status"
+    put (Building _ _) = internalError "Cannot serialize the Building status"
 
 type History = [QA]
 
@@ -171,7 +191,7 @@ instance Binary QA where
         case tag of
           0 -> liftM2 Oracle getQuestion getAnswer
           1 -> liftM Need (getList (liftM2 (,) getUTF8String getModTime))
-          _ -> error $ "get{QA}: unknown tag " ++ show tag
+          _ -> internalError $ "get{QA}: unknown tag " ++ show tag
     put (Oracle q a) = putWord8 0 >> putQuestion q >> putAnswer a
     put (Need xes)   = putWord8 1 >> putList (\(fp, mtime) -> putUTF8String fp >> putModTime mtime) xes
 
@@ -261,7 +281,7 @@ defaultOracle :: Oracle
 -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
 --default_oracle ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
 defaultOracle ("ls", what) = lines $ unsafePerformIO $ systemStdout' ("ls " ++ what)
-defaultOracle question     = error $ "The default oracle cannot answer the question " ++ show question
+defaultOracle question     = shakefileError $ "The default oracle cannot answer the question " ++ show question
 
 ls :: FilePath -> Act [FilePath]
 ls fp = query ("ls", fp)
@@ -303,46 +323,75 @@ need :: [FilePath] -> Act ()
 need fps = do
     e <- askActEnv
     
-    -- FIXME: handling of also files is not right: we should mark also files as Building
-    -- while we are building something that will yield them!
-    
+    let get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
+
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
-    (cleans, uncleans) <- liftIO $ modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
-        let (uncleans, cleans) = partitionEithers $
+    (cleans, uncleans_cleaned_rules) <- liftIO $ modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
+        let (init_uncleans, cleans) = partitionEithers $
               [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
                                            Just (Dirty hist)           -> Left (fp, Just hist)
                                            Just (Clean _ _)            -> Right (fp, Nothing)
                                            Just (Building _ wait_mvar) -> Right (fp, Just wait_mvar) -- TODO: detect dependency cycles through Building
               | fp <- fps
               ]
-        db <- (\f -> foldM f init_db uncleans) $ \db (unclean_fp, mb_hist) -> do
-            wait_mvar <- newEmptyMVar
-            return (M.insert unclean_fp (Building mb_hist wait_mvar) db)
-        return (db, (cleans, uncleans))
-    
-    let history_requires_rerun (Oracle question old_answer) = do
-            let new_answer = se_oracle (ae_global_env e) question
-            return (old_answer /= new_answer)
-        history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
-            new_time <- getFileModTime fp
-            return (Just old_time /= new_time)
-    
-        get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
-    
-    unclean_times <- liftIO $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fp, mb_hist) -> do
-        mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
-                                         Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
-        nested_time <- case mb_clean_hist of
-          Nothing         -> runRule e unclean_fp -- runRule will deal with marking the file clean
-          Just clean_hist -> do
-            -- We are actually Clean, though the history doesn't realise it yet..
-            nested_time <-  get_clean_mod_time unclean_fp
-            markClean (se_database (ae_global_env e)) unclean_fp clean_hist nested_time
-            return nested_time
         
-        -- The file must now be Clean
-        return (unclean_fp, nested_time)
+            history_requires_rerun (Oracle question old_answer) = do
+                let new_answer = se_oracle (ae_global_env e) question
+                return (old_answer /= new_answer)
+            history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
+                new_time <- getFileModTime fp
+                return (Just old_time /= new_time)
+
+            find_all_rules [] = return []
+            find_all_rules ((unclean_fp, mb_hist):uncleans) = do
+                mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
+                                                 Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
+                (creates_fps, rule) <- case mb_clean_hist of
+                  Nothing         -> findRule (ae_global_rules e) unclean_fp
+                  Just clean_hist -> return ([unclean_fp], \_ -> do
+                    nested_time <-  get_clean_mod_time unclean_fp
+                    return (clean_hist, [(unclean_fp, nested_time)]))
+                
+                -- 0) Basic sanity check that the rule creates the file we actually need
+                unless (unclean_fp `elem` creates_fps) $ shakefileError $ "A rule matched " ++ unclean_fp ++ " but claims not to create it, only the files " ++ showStringList creates_fps
+                
+                -- 1) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
+                --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
+                --    use (read or write) by another builder process.
+                let non_dirty_fps = filter (\fp -> case M.lookup fp init_db of Nothing -> False; Just (Dirty _) -> False; _ -> True) creates_fps
+                unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList creates_fps ++ " in the process of building " ++ unclean_fp ++
+                                                               ", but the files " ++ showStringList non_dirty_fps ++ " have been independently built by someone else"
+                
+                -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
+                --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
+                let (uncleans_satisifed_here, uncleans') = partition (\(next_unclean_fp, _) -> next_unclean_fp `elem` creates_fps) uncleans
+                fmap ((unclean_fp : map fst uncleans_satisifed_here, mb_hist, creates_fps, rule) :) $ find_all_rules uncleans'
+        
+        -- Figure out the rules we need to use to create all the dirty files we need
+        uncleans_rules <- find_all_rules init_uncleans
+        
+        -- Build the updated database that reflects the files that are going to be Building, and augment
+        -- the rule so that when it is run it sets all of the things it built to Clean again
+        (db, uncleans_cleaned_rules) <- (\f -> mapAccumLM f init_db uncleans_rules) $ \db (unclean_fps, mb_hist, creates_fps, rule) -> do
+            -- People wanting any of the files created by this rule should wait on the same MVar
+            wait_mvar <- newEmptyMVar
+            return (foldr (\creates_fp -> M.insert creates_fp (Building mb_hist wait_mvar)) db creates_fps,
+                   (unclean_fps, do { (nested_hist, mtimes) <- rule e;
+                                      -- This is where we mark all of the files created by the rule as Clean:
+                                      markCleans (se_database (ae_global_env e)) nested_hist creates_fps mtimes;
+                                      -- Wake up all of the waiters on the old Building entry (if any)
+                                      putMVar wait_mvar ();
+                                      return mtimes }))
+        
+        return (db, (cleans, uncleans_cleaned_rules))
+    
+    -- Run the rules we have decided upon in parallel
+    unclean_times <- fmap concat $ liftIO $ parallel (se_pool (ae_global_env e)) $ flip map uncleans_cleaned_rules $ \(unclean_fps, rule) -> do
+        mtimes <- rule
+        -- We restrict the list of modification times returned to just those files that were actually needed by the user:
+        -- we don't want to add a a dependency on those files that were incidentally created by the rule
+        return $ snd $ lookupMany (\unclean_fp -> internalError $ "We should have reported the modification time for the rule file " ++ unclean_fp) unclean_fps mtimes
     
     clean_times <- liftIO $ forM cleans $ \(clean_fp, mb_wait_mvar) -> do
         case mb_wait_mvar of
@@ -351,44 +400,39 @@ need fps = do
             -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked
             -- NB: it is safe to use isEmptyMVar here because once the wait MVar is filled it will never be emptied
             empty <- isEmptyMVar mvar
-            when empty $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (takeMVar mvar)
+            when empty $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (readMVar mvar)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     appendHistory $ Need (unclean_times ++ clean_times)
 
-markClean :: Database -> FilePath -> History -> ModTime -> IO ()
-markClean db_mvar fp nested_hist nested_time = modifyMVar_ db_mvar $ \db -> do
-    -- Ensure we notify any waiters that the file is now available:
-    let (mb_removed, db') = M.insertLookupWithKey (\_ _ status' -> status') fp (Clean nested_hist nested_time) db
-    case mb_removed of
-        Just (Building _ wait_mvar) -> putMVar wait_mvar ()
-        _                           -> return ()
-    return db'
+markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
+markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . go)
+  where (residual_nested_times, relevant_nested_times) = lookupMany (\fp -> internalError $ "Rule did not return modification time for the file " ++ fp ++ " that it claimed to create") fps nested_times
+    
+        go init_db | null residual_nested_times = foldr (\(fp, nested_time) db -> M.insert fp (Clean nested_hist nested_time) db) init_db relevant_nested_times
+                   | otherwise                  = internalError $ "Rule returned modification times for the files " ++ showStringList (map fst residual_nested_times) ++ " that it never claimed to create"
 
 
 appendHistory :: QA -> Act ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
--- NB: when runRule returns, the input file will be clean (and probably some others, too..)
-runRule :: ActEnv -> FilePath -> IO ModTime
-runRule e fp = case [(creates_fps, action) | rule <- ae_global_rules e, Just (creates_fps, action) <- [rule fp]] of
-  [(creates_fps, action)] -> do
+-- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
+findRule :: [Rule] -> FilePath -> IO (CreatesFiles, ActEnv -> IO (History, [(FilePath, ModTime)]))
+findRule rules fp = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
+  [(creates_fps, action)] -> return (creates_fps, \e -> do
       ((), final_nested_s) <- runAct e (AS { as_this_history = [] }) action
       
-      creates_time <- forM creates_fps $ \creates_fp -> do
-          nested_time <- fmap (expectJust $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
-          markClean (se_database (ae_global_env e)) creates_fp (as_this_history final_nested_s) nested_time
+      creates_times <- forM creates_fps $ \creates_fp -> do
+          nested_time <- fmap (fromMaybe $ shakefileError $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
           return (creates_fp, nested_time)
-      return $ expectJust ("The rule didn't create the file that we originally asked for, " ++ fp) $ lookup fp creates_time
+      return (as_this_history final_nested_s, creates_times))
   [] -> do
       -- Not having a rule might still be OK, as long as there is some existing file here:
       mb_nested_time <- getFileModTime fp
       case mb_nested_time of
-          Nothing          -> error $ "No rule to build " ++ fp
-          Just nested_time -> do
-            markClean (se_database (ae_global_env e)) fp [] nested_time
-            return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-  _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
+          Nothing          -> shakefileError $ "No rule to build " ++ fp
+          Just nested_time -> return ([fp], \_ -> return ([], [(fp, nested_time)])) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+  _actions -> shakefileError $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
 

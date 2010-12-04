@@ -1,8 +1,12 @@
+{-# LANGUAGE Rank2Types #-}
 module Development.Shake.Utilities where
 
 import qualified Control.Exception as Exception
 
+import Control.Arrow (second)
 import Control.Monad
+
+import Data.List
 
 import System.Exit
 import qualified System.Process as Process
@@ -21,6 +25,18 @@ handleIf p handler act = Exception.handleJust (guard . p) (\() -> handler) act
 expectJust :: String -> Maybe a -> a
 expectJust _   (Just x) = x
 expectJust msg Nothing  = error $ "expectJust: " ++ msg
+
+lookupRemove :: Eq k => k -> [(k, v)] -> Maybe (v, [(k, v)])
+lookupRemove _      []           = Nothing
+lookupRemove want_k ((k, v):kvs) | want_k == k = Just (v, kvs)
+                                 | otherwise   = fmap (second ((k, v) :)) $ lookupRemove want_k kvs
+
+lookupMany :: Eq k
+           => (forall r. k -> r)
+           -> [k] -> [(k, v)] -> ([(k, v)], [(k, v)])
+lookupMany missing_error ks init_kvs
+  = mapAccumL (\kvs k -> case lookupRemove k kvs of Nothing -> missing_error k
+                                                    Just (v, kvs') -> (kvs', (k, v))) init_kvs ks
 
 anyM :: Monad m => (a -> m Bool) -> [a] -> m Bool
 anyM p = go
