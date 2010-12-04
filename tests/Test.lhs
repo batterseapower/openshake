@@ -60,6 +60,14 @@ main = do
         
             out <- readProcess "./Main" [] ""
             ("The magic number is " ++ show constant ++ "\n") `assertEqualM` out
+        
+        -- One last run, without changing any files, to make sure that nothing gets spuriously rebuilt:
+        let interesting_files = ["Main", "main.o"]
+        old_mtimes <- mapM getModificationTime interesting_files
+        ec <- shake
+        ExitSuccess `assertEqualM` ec
+        new_mtimes <- mapM getModificationTime interesting_files
+        old_mtimes `assertEqualM` new_mtimes
 
     withCurrentDirectory "cyclic" $ do
         ec <- shake
