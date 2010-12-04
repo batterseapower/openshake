@@ -356,6 +356,7 @@ need' e fps = do
                 -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
                 -- so we recursively invoke need in order to check if we have any changes
                 -- TODO: we might get infinite recursion here
+                -- FIXME: I'm invoking need' while holding the lock!!
                 nested_new_times <- need' e nested_fps
                 let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
                 return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
