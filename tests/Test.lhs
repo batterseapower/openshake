@@ -1,12 +1,16 @@
 #! /usr/bin/env runhaskell
 
 \begin{code}
+import Control.Concurrent
+import Control.Concurrent.MVar
+
 import qualified Control.Exception as Exception
 import Control.Monad
 
 import System.Directory
 import System.Exit
 import System.Process
+import System.Timeout
 
 withCurrentDirectory :: FilePath -> IO a -> IO a
 withCurrentDirectory new_cwd act = Exception.bracket (do { old_cwd <- getCurrentDirectory; setCurrentDirectory new_cwd; return old_cwd }) setCurrentDirectory (\_ -> act)
@@ -23,12 +27,24 @@ assertIsM :: (Show a, Monad m) => (a -> Bool) -> a -> m ()
 assertIsM expectation actual = if expectation actual then return () else fail $ show actual ++ " did not match our expectations"
 
 clean :: [FilePath] -> IO ()
-clean = mapM_ removeFile
+clean = mapM_ (\fp -> doesFileExist fp >>= \exists -> when exists (removeFile fp))
+
+-- | Allows us to timeout even blocking that is not due to the Haskell RTS, by running the action to time out on
+-- another thread.
+timeoutForeign :: Int -> IO a -> IO (Maybe a)
+timeoutForeign microsecs act = do
+    mvar <- newEmptyMVar
+    forkIO $ act >>= putMVar mvar -- NB: leaves the foreign thing running even once the timeout has passed!
+    timeout microsecs $ takeMVar mvar
 
 shake :: IO ExitCode
 shake = do
     ph <- runProcess "runghc" ["-i../../", "Shakefile.hs"] Nothing Nothing Nothing Nothing Nothing
-    waitForProcess ph
+    let seconds = (*1000000)
+    mb_ec <- timeoutForeign (seconds 10) $ waitForProcess ph
+    case mb_ec of
+      Nothing -> error "shake took too long to run!"
+      Just ec -> return ec
 
 main :: IO ()
 main = do
@@ -45,4 +61,8 @@ main = do
             out <- readProcess "./Main" [] ""
             ("The magic number is " ++ show constant ++ "\n") `assertEqualM` out
 
-\end{code}    
+    withCurrentDirectory "cyclic" $ do
+        ec <- shake
+        isExitFailure `assertIsM` ec
+
+\end{code}
