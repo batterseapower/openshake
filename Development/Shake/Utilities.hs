@@ -7,6 +7,7 @@ import Control.Arrow (second)
 import Control.Monad
 
 import Data.List
+import Data.Maybe
 
 import System.Exit
 import qualified System.Process as Process
@@ -46,12 +47,15 @@ anyM p = go
             if b then return True
                  else go xs
 
-firstJustM :: Monad m => (a -> m (Maybe b)) -> [a] -> m (Maybe b)
-firstJustM f = go
+firstJustM :: Monad m => [m (Maybe a)] -> m (Maybe a)
+firstJustM = go
   where go []     = return Nothing
-        go (x:xs) = do
-            mb_y <- f x
-            maybe (go xs) (return . Just) mb_y
+        go (mmb_x:xs) = do
+            mb_x <- mmb_x
+            maybe (go xs) (return . Just) mb_x
+
+firstJust :: [Maybe a] -> Maybe a
+firstJust = listToMaybe . catMaybes
 
 replicateM :: Monad m => Int -> m b -> m [b]
 replicateM = genericReplicateM

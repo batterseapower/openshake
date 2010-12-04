@@ -140,16 +140,21 @@ type Database = MVar PureDatabase
 type PureDatabase = Map FilePath Status
 
 getPureDatabase :: Get PureDatabase
-getPureDatabase = fmap M.fromList $ getList (liftM2 (,) getUTF8String get)
+getPureDatabase = fmap M.fromList $ getList (liftM2 (,) getUTF8String (fmap Dirty getHistory))
 
 putPureDatabase :: PureDatabase -> Put
-putPureDatabase db = putList (\(k, v) -> putUTF8String k >> put v) (M.toList $ M.mapMaybe sanitizeStatus db)
+putPureDatabase db = putList (\(k, v) -> putUTF8String k >> putHistory v) (M.toList $ M.mapMaybe prepareStatus db)
 
 -- NB: we seralize Building as Dirty in case we ever want to serialize the database concurrently
 -- with shake actually running. This might be useful to implement e.g. checkpointing...
-sanitizeStatus :: Status -> Maybe Status
-sanitizeStatus (Building mb_hist _) = fmap Dirty mb_hist
-sanitizeStatus stat = Just stat
+--
+-- NB: we serialize Clean as Dirty as well. This is because when we reload the database we cannot
+-- assume that anything is clean, as one of the things it depends on may have been changed. We have to
+-- verify all our assumptions again!
+prepareStatus :: Status -> Maybe History
+prepareStatus (Building mb_hist _) = mb_hist
+prepareStatus (Dirty hist)         = Just hist
+prepareStatus (Clean hist _ )      = Just hist
 
 data Status = Dirty History
             | Clean History ModTime
@@ -160,17 +165,6 @@ instance NFData Status where
     rnf (Dirty a) = rnf a
     rnf (Clean a b) = rnf a `seq` rnfModTime b
     rnf (Building a b) = rnf a `seq` b `seq` ()
-
-instance Binary Status where
-    get = do
-        tag <- getWord8
-        case tag of
-          0 -> liftM Dirty getHistory
-          1 -> liftM2 Clean getHistory getModTime
-          _ -> internalError $ "get{Status}: unknown tag " ++ show tag
-    put (Dirty hist)       = putWord8 0 >> putHistory hist
-    put (Clean hist mtime) = putWord8 1 >> putHistory hist >> putModTime mtime
-    put (Building _ _) = internalError "Cannot serialize the Building status"
 
 type History = [QA]
 
@@ -328,13 +322,17 @@ addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 need :: [FilePath] -> Act ()
 need fps = do
     e <- askActEnv
-    verbosity <- actVerbosity
+    need_times <- liftIO $ need' e fps
+    appendHistory $ Need need_times
     
-    let get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
+need' :: ActEnv -> [FilePath] -> IO [(FilePath, ModTime)]
+need' e fps = do
+    let verbosity = se_verbosity (ae_global_env e)
+        get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
-    (cleans, uncleans_cleaned_rules) <- liftIO $ modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
+    (cleans, uncleans_cleaned_rules) <- modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
         let (init_uncleans, cleans) = partitionEithers $
               [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
                                            Just (Dirty hist)           -> Left (fp, Just hist)
@@ -342,20 +340,29 @@ need fps = do
                                            Just (Building _ wait_mvar) -> Right (fp, Just wait_mvar) -- TODO: detect dependency cycles through Building
               | fp <- fps
               ]
-        
+
+            -- We assume that the rules do not change to include new dependencies often: this lets
+            -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
+            -- of the rule have not changed
             history_requires_rerun :: QA -> IO (Maybe String)
             history_requires_rerun (Oracle question old_answer) = do
                 let new_answer = se_oracle (ae_global_env e) question
                 return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-            history_requires_rerun (Need nested_fps) = flip firstJustM nested_fps $ \(fp, old_time) -> do
-                new_time <- getFileModTime fp
-                return $ guard (Just old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
+            history_requires_rerun (Need nested_fps_times) = do
+                let (nested_fps, nested_old_times) = unzip nested_fps_times
+                -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
+                -- so we recursively invoke need in order to check if we have any changes
+                -- TODO: we might get infinite recursion here
+                nested_new_times <- need' e nested_fps
+                let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
+                return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
+                    \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
             find_all_rules [] = return []
             find_all_rules ((unclean_fp, mb_hist):uncleans) = do
                 mb_clean_hist <- do
                     ei_clean_hist_dirty_reason <- case mb_hist of Nothing   -> return (Right "file was not in the database")
-                                                                  Just hist -> fmap (maybe (Left hist) Right) $ firstJustM history_requires_rerun hist
+                                                                  Just hist -> fmap (maybe (Left hist) Right) $ firstJustM $ map history_requires_rerun hist
                     case ei_clean_hist_dirty_reason of
                       Left clean_hist -> return (Just clean_hist)
                       Right dirty_reason -> do
@@ -406,13 +413,13 @@ need fps = do
         return (db, (cleans, uncleans_cleaned_rules))
     
     -- Run the rules we have decided upon in parallel
-    unclean_times <- fmap concat $ liftIO $ parallel (se_pool (ae_global_env e)) $ flip map uncleans_cleaned_rules $ \(unclean_fps, rule) -> do
+    unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans_cleaned_rules $ \(unclean_fps, rule) -> do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
         return $ snd $ lookupMany (\unclean_fp -> internalError $ "We should have reported the modification time for the rule file " ++ unclean_fp) unclean_fps mtimes
     
-    clean_times <- liftIO $ forM cleans $ \(clean_fp, mb_wait_handle) -> do
+    clean_times <- forM cleans $ \(clean_fp, mb_wait_handle) -> do
         case mb_wait_handle of
           Nothing -> return ()
           Just wait_handle -> do
@@ -422,14 +429,13 @@ need fps = do
             when may_wait $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
-    appendHistory $ Need (unclean_times ++ clean_times)
+    return $ unclean_times ++ clean_times
 
 markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
 markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . go)
-  where (residual_nested_times, relevant_nested_times) = lookupMany (\fp -> internalError $ "Rule did not return modification time for the file " ++ fp ++ " that it claimed to create") fps nested_times
+  where ([], relevant_nested_times) = lookupMany (\fp -> internalError $ "Rule did not return modification time for the file " ++ fp ++ " that it claimed to create") fps nested_times
     
-        go init_db | null residual_nested_times = foldr (\(fp, nested_time) db -> M.insert fp (Clean nested_hist nested_time) db) init_db relevant_nested_times
-                   | otherwise                  = internalError $ "Rule returned modification times for the files " ++ showStringList (map fst residual_nested_times) ++ " that it never claimed to create"
+        go init_db = foldr (\(fp, nested_time) db -> M.insert fp (Clean nested_hist nested_time) db) init_db relevant_nested_times
 
 
 appendHistory :: QA -> Act ()
