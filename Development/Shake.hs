@@ -508,7 +508,6 @@ putAnswer = putList putUTF8String
 
 type Oracle = Question -> Answer
 
--- TODO: lexically scoped semantics for the oracle
 -- TODO: oracle polymorphism
 -- TODO: supply old oracle to the new oracle function
 oracle :: Oracle -> Shake a -> Shake a
