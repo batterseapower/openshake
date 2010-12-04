@@ -145,5 +145,11 @@ main = do
         
         ec <- shake
         isExitFailure `assertIsM` ec
+    
+    withCurrentDirectory "cyclic-harder" $ do
+        clean [".openshake-db"]
+    
+        ec <- shake
+        isExitFailure `assertIsM` ec
 
 \end{code}
