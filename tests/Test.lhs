@@ -137,6 +137,9 @@ main = do
         ec <- shake
         ExitSuccess `assertEqualM` ec
 
+    -- TODO: test that nothing goes wrong if we change the type of oracle between runs
+    -- TODO: test that nothing goes wrong if we change the serialization of question/answer fields between runs
+
     withCurrentDirectory "cyclic" $ do
         clean [".openshake-db"]
         

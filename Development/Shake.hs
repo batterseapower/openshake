@@ -220,6 +220,7 @@ putOracle :: forall o. Oracle o
           -> (String, BS.ByteString, BS.ByteString)
 putOracle q a = (show (typeOf (undefined :: o)), runPut $ put q, runPut $ put a)
 
+-- TODO: catch any errors incurred when deserializing the question and answer
 peekOracle :: forall o. Oracle o
            => String -> BS.ByteString -> BS.ByteString
            -> Maybe (Question o, Answer o)
@@ -602,8 +603,9 @@ findRule rules fp k = case [(creates_fps, action) | rule <- rules, Just (creates
       mb_nested_time <- getFileModTime fp
       case mb_nested_time of
           Nothing          -> shakefileError $ "No rule to build " ++ fp
-          -- TODO: this fake oracle is probably reachable if we change from having a rule for a file to not having one,
-          -- but the file existing. In that case we will try to recheck the old oracle answers against our Error!
+          -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
+          -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
+          -- check will catch the change.
           Just nested_time -> k ((), [fp], \_ -> return ([], [(fp, nested_time)])) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
   _actions -> shakefileError $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
