@@ -269,7 +269,11 @@ addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 
 need :: [FilePath] -> Act ()
 need fps = do
-    (cleans, mvared_uncleans) <- modifyActDatabase $ \init_db -> do
+    e <- askActEnv
+    
+    -- NB: this MVar operation does not block us because any thread only holds the database lock
+    -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
+    (cleans, mvared_uncleans) <- liftIO $ modifyMVar (ae_global_database e) $ \init_db -> do
         let (uncleans, cleans) = partitionEithers $
               [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
                                            Just (Dirty hist)           -> Left (fp, Just hist)
@@ -283,25 +287,23 @@ need fps = do
         return (db, (cleans, uncleans))
     
     let history_requires_rerun (Oracle question old_answer) = do
-            new_answer <- unsafeQuery question
+            let new_answer = ae_global_oracle e question
             return (old_answer /= new_answer)
         history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
-            new_time <- liftIO $ getFileModTime fp
+            new_time <- getFileModTime fp
             return (Just old_time /= new_time)
     
         get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
     
-    pool <- fmap ae_global_pool askActEnv
-    
-    unclean_times <- forM mvared_uncleans $ \(unclean_fp, mb_hist) -> do
+    unclean_times <- liftIO $ parallel (ae_global_pool e) $ flip map mvared_uncleans $ \(unclean_fp, mb_hist) -> do
         mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
                                          Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
         nested_time <- case mb_clean_hist of
-          Nothing         -> runRule unclean_fp -- runRule will deal with marking the file clean
+          Nothing         -> runRule e unclean_fp -- runRule will deal with marking the file clean
           Just clean_hist -> do
             -- We are actually Clean, though the history doesn't realise it yet..
-            nested_time <- liftIO $ get_clean_mod_time unclean_fp
-            markClean unclean_fp clean_hist nested_time
+            nested_time <-  get_clean_mod_time unclean_fp
+            markClean (ae_global_database e) unclean_fp clean_hist nested_time
             return nested_time
         
         -- The file must now be Clean
@@ -314,13 +316,13 @@ need fps = do
             -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked
             -- NB: it is safe to use isEmptyMVar here because once the wait MVar is filled it will never be emptied
             empty <- isEmptyMVar mvar
-            when empty $ extraWorkerWhileBlocked pool (takeMVar mvar)
+            when empty $ extraWorkerWhileBlocked (ae_global_pool e) (takeMVar mvar)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     appendHistory $ Need (unclean_times ++ clean_times)
 
-markClean :: FilePath -> History -> ModTime -> Act ()
-markClean fp nested_hist nested_time = modifyActDatabase_ $ \db -> do
+markClean :: Database -> FilePath -> History -> ModTime -> IO ()
+markClean db_mvar fp nested_hist nested_time = modifyMVar_ db_mvar $ \db -> do
     -- Ensure we notify any waiters that the file is now available:
     let (mb_removed, db') = M.insertLookupWithKey (\_ _ status' -> status') fp (Clean nested_hist nested_time) db
     case mb_removed of
@@ -329,42 +331,29 @@ markClean fp nested_hist nested_time = modifyActDatabase_ $ \db -> do
     return db'
 
 
-modifyActDatabase_ :: (PureDatabase -> IO PureDatabase) -> Act ()
-modifyActDatabase_ f = modifyActDatabase (\db -> fmap (flip (,) ()) $ f db)
-
-modifyActDatabase :: (PureDatabase -> IO (PureDatabase, a)) -> Act a
-modifyActDatabase f = do
-    db_mvar <- fmap ae_global_database askActEnv
-    -- NB: this MVar operation does not block us because any thread only holds the database lock
-    -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
-    liftIO $ modifyMVar db_mvar f
-
-
 appendHistory :: QA -> Act ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when runRule returns, the input file will be clean (and probably some others, too..)
-runRule :: FilePath -> Act ModTime
-runRule fp = do
-    e <- askActEnv
-    case [(creates_fps, action) | rule <- ae_global_rules e, Just (creates_fps, action) <- [rule fp]] of
-        [(creates_fps, action)] -> do
-            ((), final_nested_s) <- liftIO $ runAct e (AS { as_this_history = [] }) action
-            
-            creates_time <- forM creates_fps $ \creates_fp -> do
-                nested_time <- fmap (expectJust $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
-                markClean creates_fp (as_this_history final_nested_s) nested_time
-                return (creates_fp, nested_time)
-            return $ expectJust ("The rule didn't create the file that we originally asked for, " ++ fp) $ lookup fp creates_time
-        [] -> do
-            -- Not having a rule might still be OK, as long as there is some existing file here:
-            mb_nested_time <- liftIO $ getFileModTime fp
-            case mb_nested_time of
-                Nothing          -> error $ "No rule to build " ++ fp
-                Just nested_time -> do
-                  markClean fp [] nested_time
-                  return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-        _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
+runRule :: ActEnv -> FilePath -> IO ModTime
+runRule e fp = case [(creates_fps, action) | rule <- ae_global_rules e, Just (creates_fps, action) <- [rule fp]] of
+  [(creates_fps, action)] -> do
+      ((), final_nested_s) <- runAct e (AS { as_this_history = [] }) action
+      
+      creates_time <- forM creates_fps $ \creates_fp -> do
+          nested_time <- fmap (expectJust $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
+          markClean (ae_global_database e) creates_fp (as_this_history final_nested_s) nested_time
+          return (creates_fp, nested_time)
+      return $ expectJust ("The rule didn't create the file that we originally asked for, " ++ fp) $ lookup fp creates_time
+  [] -> do
+      -- Not having a rule might still be OK, as long as there is some existing file here:
+      mb_nested_time <- getFileModTime fp
+      case mb_nested_time of
+          Nothing          -> error $ "No rule to build " ++ fp
+          Just nested_time -> do
+            markClean (ae_global_database e) fp [] nested_time
+            return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+  _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
 
@@ -387,14 +376,9 @@ type Oracle = Question -> Answer
 oracle :: Oracle -> Shake a -> Shake a
 oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: some way to combine with previous oracle?
 
--- | Like 'query', but doesn't record that the question was asked
-unsafeQuery :: Question -> Act Answer
-unsafeQuery question = do
-    e <- askActEnv
-    return $ ae_global_oracle e question
-
 query :: Question -> Act Answer
 query question = do
-    answer <- unsafeQuery question
+    e <- askActEnv
+    let answer = ae_global_oracle e question
     appendHistory $ Oracle question answer
     return answer
