@@ -40,7 +40,7 @@ import qualified Data.Map as M
 
 import System.Directory
 import System.FilePath.Glob
-import System.Time (CalendarTime, toCalendarTime)
+import System.Time (ClockTime(..))
 
 import System.IO.Unsafe
 
@@ -83,21 +83,19 @@ localShakeEnv :: (ShakeEnv -> ShakeEnv) -> Shake a -> Shake a
 localShakeEnv f mx = Shake (Reader.local f (unShake mx))
 
 
-type ModTime = CalendarTime
+type ModTime = ClockTime
 
--- TODO: more efficient normalisation
 rnfModTime :: ModTime -> ()
-rnfModTime mtime = rnf (show mtime)
+rnfModTime (TOD a b) = rnf a `seq` rnf b
 
--- TODO: more efficient serialisation
 getModTime :: Get ModTime
-getModTime = fmap read getUTF8String
+getModTime = liftM2 TOD get get
 
 putModTime :: ModTime -> Put
-putModTime mtime = putUTF8String (show mtime)
+putModTime (TOD a b) = put a >> put b
 
 getFileModTime :: FilePath -> IO (Maybe ModTime)
-getFileModTime fp = handleDoesNotExist (return Nothing) (getModificationTime fp >>= (fmap Just . toCalendarTime))
+getFileModTime fp = handleDoesNotExist (return Nothing) (fmap Just (getModificationTime fp))
 
 
 type Database = MVar PureDatabase
