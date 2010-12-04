@@ -15,6 +15,7 @@ module Development.Shake (
     Oracle, Question, Answer, defaultOracle, ls
   ) where
 
+import Development.Shake.WaitHandle
 import Development.Shake.Utilities
 
 import Data.Binary
@@ -152,7 +153,8 @@ sanitizeStatus stat = Just stat
 
 data Status = Dirty History
             | Clean History ModTime
-            | Building (Maybe History) (MVar ())
+            | Building (Maybe History) WaitHandle
+            deriving (Show)
 
 instance NFData Status where
     rnf (Dirty a) = rnf a
@@ -180,6 +182,7 @@ putHistory = putList put
 
 data QA = Oracle Question Answer
         | Need [(FilePath, ModTime)]
+        deriving (Show)
 
 instance NFData QA where
     rnf (Oracle a b) = rnf a `seq` rnf b
@@ -270,6 +273,8 @@ shake mx = withPool numCapabilities $ \pool -> do
             when (verbosity >= NormalVerbosity) $ putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
             return M.empty
           where db = runGet getPureDatabase bs
+    
+    when (verbosity >= ChattyVerbosity) $ putStrLn $ "Initial database:\n" ++ show db
     db_mvar <- newMVar db
     
     ((), _final_s) <- runShake (SE { se_database = db_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
@@ -384,13 +389,13 @@ need fps = do
         -- the rule so that when it is run it sets all of the things it built to Clean again
         (db, uncleans_cleaned_rules) <- (\f -> mapAccumLM f init_db uncleans_rules) $ \db (unclean_fps, mb_hist, creates_fps, rule) -> do
             -- People wanting any of the files created by this rule should wait on the same MVar
-            wait_mvar <- newEmptyMVar
-            return (foldr (\creates_fp -> M.insert creates_fp (Building mb_hist wait_mvar)) db creates_fps,
+            wait_handle <- newWaitHandle
+            return (foldr (\creates_fp -> M.insert creates_fp (Building mb_hist wait_handle)) db creates_fps,
                    (unclean_fps, do { (nested_hist, mtimes) <- rule e;
                                       -- This is where we mark all of the files created by the rule as Clean:
                                       markCleans (se_database (ae_global_env e)) nested_hist creates_fps mtimes;
                                       -- Wake up all of the waiters on the old Building entry (if any)
-                                      putMVar wait_mvar ();
+                                      awakeWaiters wait_handle;
                                       return mtimes }))
         
         return (db, (cleans, uncleans_cleaned_rules))
@@ -402,14 +407,14 @@ need fps = do
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
         return $ snd $ lookupMany (\unclean_fp -> internalError $ "We should have reported the modification time for the rule file " ++ unclean_fp) unclean_fps mtimes
     
-    clean_times <- liftIO $ forM cleans $ \(clean_fp, mb_wait_mvar) -> do
-        case mb_wait_mvar of
+    clean_times <- liftIO $ forM cleans $ \(clean_fp, mb_wait_handle) -> do
+        case mb_wait_handle of
           Nothing -> return ()
-          Just mvar -> do
+          Just wait_handle -> do
             -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked
             -- NB: it is safe to use isEmptyMVar here because once the wait MVar is filled it will never be emptied
-            empty <- isEmptyMVar mvar
-            when empty $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (readMVar mvar)
+            may_wait <- mayWaitOnWaitHandle wait_handle
+            when may_wait $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     appendHistory $ Need (unclean_times ++ clean_times)
