@@ -25,6 +25,7 @@ import qualified Data.ByteString.Lazy as BS
 import qualified Codec.Binary.UTF8.String as UTF8
 
 import Control.Applicative (Applicative)
+import Control.Arrow (first, second)
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -38,7 +39,6 @@ import qualified Control.Monad.Trans.State as State
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class
 
-import Data.Either
 -- import Data.Set (Set)
 -- import qualified Data.Set as S
 import Data.Map (Map)
@@ -329,22 +329,14 @@ need fps = do
     appendHistory $ Need need_times
     
 need' :: ActEnv -> [FilePath] -> IO [(FilePath, ModTime)]
-need' e fps = do
+need' e init_fps = do
     let verbosity = se_verbosity (ae_global_env e)
         get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
     (cleans, uncleans_cleaned_rules) <- modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
-        let (init_uncleans, cleans) = partitionEithers $
-              [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
-                                           Just (Dirty hist)           -> Left (fp, Just hist)
-                                           Just (Clean _ _)            -> Right (fp, Nothing)
-                                           Just (Building _ wait_mvar) -> Right (fp, Just wait_mvar) -- TODO: detect dependency cycles through Building
-              | fp <- fps
-              ]
-
-            -- We assume that the rules do not change to include new dependencies often: this lets
+        let -- We assume that the rules do not change to include new dependencies often: this lets
             -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
             -- of the rule have not changed
             history_requires_rerun :: QA -> IO (Maybe String)
@@ -362,44 +354,52 @@ need' e fps = do
                 return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                     \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
-            find_all_rules [] = return []
-            find_all_rules ((unclean_fp, mb_hist):uncleans) = do
-                mb_clean_hist <- do
-                    ei_clean_hist_dirty_reason <- case mb_hist of Nothing   -> return (Right "file was not in the database")
-                                                                  Just hist -> fmap (maybe (Left hist) Right) $ firstJustM $ map history_requires_rerun hist
-                    case ei_clean_hist_dirty_reason of
-                      Left clean_hist -> return (Just clean_hist)
-                      Right dirty_reason -> do
-                        when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ unclean_fp ++ " because " ++ dirty_reason
-                        return Nothing
-                (creates_fps, rule) <- case mb_clean_hist of
-                  Nothing         -> findRule (ae_global_rules e) unclean_fp
-                  Just clean_hist -> return ([unclean_fp], \_ -> do
-                    nested_time <- get_clean_mod_time unclean_fp
-                    return (clean_hist, [(unclean_fp, nested_time)]))
+            find_all_rules [] = return ([], [])
+            find_all_rules (fp:fps) = do
+                let ei_unclean_clean = case M.lookup fp init_db of
+                      Nothing                     -> Left Nothing
+                      Just (Dirty hist)           -> Left (Just hist)
+                      Just (Clean _ _)            -> Right Nothing
+                      Just (Building _ wait_mvar) -> Right (Just wait_mvar) -- TODO: detect dependency cycles through Building
+                case ei_unclean_clean of
+                    Right mb_mvar -> 
+                      fmap (first ((fp, mb_mvar) :)) $ find_all_rules fps
+                    Left mb_hist -> do
+                      mb_clean_hist <- do
+                          ei_clean_hist_dirty_reason <- case mb_hist of Nothing   -> return (Right "file was not in the database")
+                                                                        Just hist -> fmap (maybe (Left hist) Right) $ firstJustM $ map history_requires_rerun hist
+                          case ei_clean_hist_dirty_reason of
+                            Left clean_hist -> return (Just clean_hist)
+                            Right dirty_reason -> do
+                              when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ fp ++ " because " ++ dirty_reason
+                              return Nothing
+                      (creates_fps, rule) <- case mb_clean_hist of
+                        Nothing         -> findRule (ae_global_rules e) fp
+                        Just clean_hist -> return ([fp], \_ -> do
+                          nested_time <- get_clean_mod_time fp
+                          return (clean_hist, [(fp, nested_time)]))
                 
-                -- 0) Basic sanity check that the rule creates the file we actually need
-                unless (unclean_fp `elem` creates_fps) $ shakefileError $ "A rule matched " ++ unclean_fp ++ " but claims not to create it, only the files " ++ showStringList creates_fps
+                      -- 0) Basic sanity check that the rule creates the file we actually need
+                      unless (fp `elem` creates_fps) $ shakefileError $ "A rule matched " ++ fp ++ " but claims not to create it, only the files " ++ showStringList creates_fps
                 
-                -- 1) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
-                --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
-                --    use (read or write) by another builder process.
-                let non_dirty_fps = filter (\fp -> case M.lookup fp init_db of Nothing -> False; Just (Dirty _) -> False; _ -> True) creates_fps
-                unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList creates_fps ++ " in the process of building " ++ unclean_fp ++
-                                                               ", but the files " ++ showStringList non_dirty_fps ++ " have been independently built by someone else"
+                      -- 1) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
+                      --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
+                      --    use (read or write) by another builder process.
+                      let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp init_db of Nothing -> False; Just (Dirty _) -> False; _ -> True) creates_fps
+                      unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList creates_fps ++ " in the process of building " ++ fp ++
+                                                                     ", but the files " ++ showStringList non_dirty_fps ++ " have been independently built by someone else"
                 
-                -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
-                --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
-                let (uncleans_satisifed_here, uncleans') = partition (\(next_unclean_fp, _) -> next_unclean_fp `elem` creates_fps) uncleans
-                fmap ((unclean_fp : map fst uncleans_satisifed_here, mb_hist, creates_fps, rule) :) $ find_all_rules uncleans'
+                      -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
+                      --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
+                      let (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
+                      fmap (second ((fp : next_fps_satisifed_here, mb_hist, creates_fps, rule) :)) $ find_all_rules fps'
         
         -- Figure out the rules we need to use to create all the dirty files we need
-        uncleans_rules <- find_all_rules init_uncleans
+        (cleans, uncleans_rules) <- find_all_rules init_fps
         let all_creates_fps = [creates_fp | (_, _, creates_fps, _) <- uncleans_rules, creates_fp <- creates_fps]
         when (not (null uncleans_rules) && verbosity >= ChattyVerbosity) $
             putStrLn $ "Using " ++ show (length uncleans_rules) ++ " rule instances to create " ++
-                       show (length all_creates_fps) ++ " files (" ++ showStringList all_creates_fps ++
-                       "), including the unclean files " ++ showStringList (map fst init_uncleans)
+                       show (length all_creates_fps) ++ " files (" ++ showStringList all_creates_fps ++ ")"
         
         -- Build the updated database that reflects the files that are going to be Building, and augment
         -- the rule so that when it is run it sets all of the things it built to Clean again
