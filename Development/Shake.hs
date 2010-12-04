@@ -23,7 +23,7 @@ import qualified Codec.Binary.UTF8.String as UTF8
 import Control.Applicative (Applicative)
 
 import Control.Concurrent.MVar
-import Control.Concurrent.ParallelIO.Global
+import Control.Concurrent.ParallelIO.Local
 
 import Control.DeepSeq
 import qualified Control.Exception as Exception
@@ -44,6 +44,8 @@ import System.Time (CalendarTime, toCalendarTime)
 
 import System.IO.Unsafe
 
+import GHC.Conc (numCapabilities)
+
 
 type CreatesFiles = [FilePath]
 type Rule = FilePath -> Maybe (CreatesFiles, Act ())
@@ -54,6 +56,7 @@ data ShakeState = SS {
   }
 
 data ShakeEnv = SE {
+    se_pool :: Pool,
     se_oracle :: Oracle
   }
 
@@ -181,7 +184,8 @@ data ActState = AS {
 data ActEnv = AE {
     ae_global_database :: Database,
     ae_global_rules :: [Rule],
-    ae_global_oracle :: Oracle
+    ae_global_oracle :: Oracle,
+    ae_global_pool :: Pool
   }
 
 newtype Act a = Act { unAct :: Reader.ReaderT ActEnv (State.StateT ActState IO) a }
@@ -205,7 +209,7 @@ askActEnv = Act Reader.ask
 
 -- NB: you can only use shake once per program run
 shake :: Shake () -> IO ()
-shake mx = do
+shake mx = withPool numCapabilities $ \pool -> do
     mb_bs <- handleDoesNotExist (return Nothing) $ fmap Just $ BS.readFile ".openshake-db"
     db <- case mb_bs of
         Nothing -> putStrLn "Database did not exist, doing full rebuild" >> return M.empty
@@ -215,12 +219,10 @@ shake mx = do
           where db = runGet getPureDatabase bs
     db_mvar <- newMVar db
     
-    ((), _final_s) <- runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_database = db_mvar }) mx
+    ((), _final_s) <- runShake (SE { se_pool = pool, se_oracle = defaultOracle }) (SS { ss_rules = [], ss_database = db_mvar }) mx
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
-    
-    stopGlobalPool
 
 
 defaultOracle :: Oracle
@@ -238,7 +240,7 @@ want :: [FilePath] -> Shake ()
 want fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_oracle = se_oracle e, ae_global_database = ss_database s }) (AS { as_this_history = [] }) (need fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_oracle = se_oracle e, ae_global_pool = se_pool e, ae_global_database = ss_database s }) (AS { as_this_history = [] }) (need fps)
     return ()
 
 (*>) :: String -> (FilePath -> Act ()) -> Shake ()
@@ -287,7 +289,10 @@ need fps = do
             new_time <- liftIO $ getFileModTime fp
             return (Just old_time /= new_time)
     
-        get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ liftIO $ getFileModTime fp
+        get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
+    
+    pool <- fmap ae_global_pool askActEnv
+    
     unclean_times <- forM mvared_uncleans $ \(unclean_fp, mb_hist) -> do
         mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
                                          Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
@@ -295,21 +300,21 @@ need fps = do
           Nothing         -> runRule unclean_fp -- runRule will deal with marking the file clean
           Just clean_hist -> do
             -- We are actually Clean, though the history doesn't realise it yet..
-            nested_time <- get_clean_mod_time unclean_fp
+            nested_time <- liftIO $ get_clean_mod_time unclean_fp
             markClean unclean_fp clean_hist nested_time
             return nested_time
         
         -- The file must now be Clean
         return (unclean_fp, nested_time)
     
-    clean_times <- forM cleans $ \(clean_fp, mb_wait_mvar) -> do
+    clean_times <- liftIO $ forM cleans $ \(clean_fp, mb_wait_mvar) -> do
         case mb_wait_mvar of
           Nothing -> return ()
-          Just mvar -> liftIO $ do
+          Just mvar -> do
             -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked
             -- NB: it is safe to use isEmptyMVar here because once the wait MVar is filled it will never be emptied
             empty <- isEmptyMVar mvar
-            when empty $ extraWorkerWhileBlocked (takeMVar mvar)
+            when empty $ extraWorkerWhileBlocked pool (takeMVar mvar)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     appendHistory $ Need (unclean_times ++ clean_times)
