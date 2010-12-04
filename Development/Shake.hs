@@ -273,7 +273,7 @@ need fps = do
     
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
-    (cleans, mvared_uncleans) <- liftIO $ modifyMVar (ae_global_database e) $ \init_db -> do
+    (cleans, uncleans) <- liftIO $ modifyMVar (ae_global_database e) $ \init_db -> do
         let (uncleans, cleans) = partitionEithers $
               [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
                                            Just (Dirty hist)           -> Left (fp, Just hist)
@@ -295,7 +295,7 @@ need fps = do
     
         get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
     
-    unclean_times <- liftIO $ parallel (ae_global_pool e) $ flip map mvared_uncleans $ \(unclean_fp, mb_hist) -> do
+    unclean_times <- liftIO $ parallel (ae_global_pool e) $ flip map uncleans $ \(unclean_fp, mb_hist) -> do
         mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
                                          Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
         nested_time <- case mb_clean_hist of
