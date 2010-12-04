@@ -583,7 +583,8 @@ need' e init_fps = do
             -- NB: Waiting on the handle leads to a deadlock iff the worker responsible for triggering that wait handle
             -- eventually waits on one of the init_blocks_fps.
             --
-            -- TODO: implement a less rubbish deadlock detector based on this observation.
+            -- TODO: implement a less rubbish cycle detector based on this observation. The current one can fall down in situations
+            -- where we have multiple threads working, because each thread will have only part of the dependency graph.
             -- One possible scheme:
             --  1) Add the init_blocks_fps to the WaitHandle somehow just before waiting on it
             --  2) Check if the wait handle has FilePaths attached that I am responsible for triggering in the future just before waiting on it
