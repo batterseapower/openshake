@@ -7,6 +7,7 @@ import Control.Concurrent.MVar
 import qualified Control.Exception as Exception
 import Control.Monad
 
+import System.Environment
 import System.Directory
 import System.Exit
 import System.Process
@@ -39,7 +40,9 @@ timeoutForeign microsecs cleanup act = flip Exception.finally cleanup $ do
 
 shake :: IO ExitCode
 shake = do
-    ph <- runProcess "runghc" ["-i../../", "Shakefile.hs"] Nothing Nothing Nothing Nothing Nothing
+    extra_args <- getArgs -- NB: this is a bit of a hack!
+    
+    ph <- runProcess "runghc" (["-i../../", "Shakefile.hs"] ++ extra_args) Nothing Nothing Nothing Nothing Nothing
     let seconds = (*1000000)
     mb_ec <- timeoutForeign (seconds 10) (terminateProcess ph) $ waitForProcess ph
     case mb_ec of
