@@ -51,11 +51,11 @@ type CreatesFiles = [FilePath]
 type Rule = FilePath -> Maybe (CreatesFiles, Act ())
 
 data ShakeState = SS {
-    ss_rules :: [Rule],
-    ss_database :: Database
+    ss_rules :: [Rule]
   }
 
 data ShakeEnv = SE {
+    se_database :: Database,
     se_pool :: Pool,
     se_oracle :: Oracle
   }
@@ -182,10 +182,8 @@ data ActState = AS {
   }
 
 data ActEnv = AE {
-    ae_global_database :: Database,
-    ae_global_rules :: [Rule],
-    ae_global_oracle :: Oracle,
-    ae_global_pool :: Pool
+    ae_global_env :: ShakeEnv,
+    ae_global_rules :: [Rule]
   }
 
 newtype Act a = Act { unAct :: Reader.ReaderT ActEnv (State.StateT ActState IO) a }
@@ -220,7 +218,7 @@ shake mx = withPool numCapabilities $ \pool -> do
           where db = runGet getPureDatabase bs
     db_mvar <- newMVar db
     
-    ((), _final_s) <- runShake (SE { se_pool = pool, se_oracle = defaultOracle }) (SS { ss_rules = [], ss_database = db_mvar }) mx
+    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_pool = pool, se_oracle = defaultOracle }) (SS { ss_rules = [] }) mx
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -241,7 +239,7 @@ want :: [FilePath] -> Shake ()
 want fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_oracle = se_oracle e, ae_global_pool = se_pool e, ae_global_database = ss_database s }) (AS { as_this_history = [] }) (need fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_env = e }) (AS { as_this_history = [] }) (need fps)
     return ()
 
 (*>) :: String -> (FilePath -> Act ()) -> Shake ()
@@ -274,7 +272,7 @@ need fps = do
     
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff)
-    (cleans, uncleans) <- liftIO $ modifyMVar (ae_global_database e) $ \init_db -> do
+    (cleans, uncleans) <- liftIO $ modifyMVar (se_database (ae_global_env e)) $ \init_db -> do
         let (uncleans, cleans) = partitionEithers $
               [case M.lookup fp init_db of Nothing                     -> Left (fp, Nothing)
                                            Just (Dirty hist)           -> Left (fp, Just hist)
@@ -288,7 +286,7 @@ need fps = do
         return (db, (cleans, uncleans))
     
     let history_requires_rerun (Oracle question old_answer) = do
-            let new_answer = ae_global_oracle e question
+            let new_answer = se_oracle (ae_global_env e) question
             return (old_answer /= new_answer)
         history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
             new_time <- getFileModTime fp
@@ -296,7 +294,7 @@ need fps = do
     
         get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
     
-    unclean_times <- liftIO $ parallel (ae_global_pool e) $ flip map uncleans $ \(unclean_fp, mb_hist) -> do
+    unclean_times <- liftIO $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fp, mb_hist) -> do
         mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
                                          Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
         nested_time <- case mb_clean_hist of
@@ -304,7 +302,7 @@ need fps = do
           Just clean_hist -> do
             -- We are actually Clean, though the history doesn't realise it yet..
             nested_time <-  get_clean_mod_time unclean_fp
-            markClean (ae_global_database e) unclean_fp clean_hist nested_time
+            markClean (se_database (ae_global_env e)) unclean_fp clean_hist nested_time
             return nested_time
         
         -- The file must now be Clean
@@ -317,7 +315,7 @@ need fps = do
             -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked
             -- NB: it is safe to use isEmptyMVar here because once the wait MVar is filled it will never be emptied
             empty <- isEmptyMVar mvar
-            when empty $ extraWorkerWhileBlocked (ae_global_pool e) (takeMVar mvar)
+            when empty $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (takeMVar mvar)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     appendHistory $ Need (unclean_times ++ clean_times)
@@ -343,7 +341,7 @@ runRule e fp = case [(creates_fps, action) | rule <- ae_global_rules e, Just (cr
       
       creates_time <- forM creates_fps $ \creates_fp -> do
           nested_time <- fmap (expectJust $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
-          markClean (ae_global_database e) creates_fp (as_this_history final_nested_s) nested_time
+          markClean (se_database (ae_global_env e)) creates_fp (as_this_history final_nested_s) nested_time
           return (creates_fp, nested_time)
       return $ expectJust ("The rule didn't create the file that we originally asked for, " ++ fp) $ lookup fp creates_time
   [] -> do
@@ -352,7 +350,7 @@ runRule e fp = case [(creates_fps, action) | rule <- ae_global_rules e, Just (cr
       case mb_nested_time of
           Nothing          -> error $ "No rule to build " ++ fp
           Just nested_time -> do
-            markClean (ae_global_database e) fp [] nested_time
+            markClean (se_database (ae_global_env e)) fp [] nested_time
             return nested_time -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
   _actions -> error $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
@@ -380,6 +378,6 @@ oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: 
 query :: Question -> Act Answer
 query question = do
     e <- askActEnv
-    let answer = ae_global_oracle e question
+    let answer = se_oracle (ae_global_env e) question
     appendHistory $ Oracle question answer
     return answer
