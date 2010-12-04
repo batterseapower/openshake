@@ -213,7 +213,8 @@ shake mx = withPool numCapabilities $ \pool -> do
     mb_bs <- handleDoesNotExist (return Nothing) $ fmap Just $ BS.readFile ".openshake-db"
     db <- case mb_bs of
         Nothing -> putStrLn "Database did not exist, doing full rebuild" >> return M.empty
-        Just bs -> (Exception.evaluate (rnf db) >> return db) `Exception.catch` \(Exception.ErrorCall reason) -> do
+         -- NB: we force the input ByteString because we really want the database file to be closed promptly
+        Just bs -> length (BS.unpack bs) `seq` (Exception.evaluate (rnf db) >> return db) `Exception.catch` \(Exception.ErrorCall reason) -> do
                       putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
                       return M.empty
           where db = runGet getPureDatabase bs
