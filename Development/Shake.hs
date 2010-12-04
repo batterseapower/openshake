@@ -259,6 +259,7 @@ data ActState = AS {
 
 data ActEnv o = AE {
     ae_oracle :: o, -- NB: Act *should not* (and cannot, thanks to the type system) access the Oracle from the ShakeEnv, because that is the "dynamically scoped" one
+    ae_blocks_fps :: [FilePath],
     ae_global_env :: ShakeEnv (),
     ae_global_rules :: [SomeRule]
   }
@@ -266,6 +267,7 @@ data ActEnv o = AE {
 instance Functor ActEnv where
     fmap f ae = AE {
         ae_oracle = f (ae_oracle ae),
+        ae_blocks_fps = ae_blocks_fps ae,
         ae_global_env = ae_global_env ae,
         ae_global_rules = ae_global_rules ae
       }
@@ -409,7 +411,7 @@ want :: [FilePath] -> Shake o ()
 want fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_blocks_fps = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need fps)
     return ()
 
 (*>) :: Oracle o => String -> (FilePath -> Act o ()) -> Shake o ()
@@ -448,6 +450,10 @@ addRule rule = do
 need :: [FilePath] -> Act o ()
 need fps = do
     e <- askActEnv
+    -- NB: the initial list of blocked files is empty because whenever need is invoked (via runAct on a rule),
+    -- the rule runs that will create the other files are already setup to run in parallel
+    -- FIXME: an parallel Act execution blocks *its own file* from being created if it waits on a WaitHandle.
+    -- Must take account of that!
     need_times <- liftIO $ need' e fps
     appendHistory $ Need need_times
 
@@ -463,24 +469,23 @@ need' e init_fps = do
     let -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
         -- of the rule have not changed
-        history_requires_rerun :: Oracle o => o -> QA -> IO (Maybe String)
-        history_requires_rerun o (Oracle td bs_q bs_a) = 
+        history_requires_rerun :: [FilePath] -> Oracle o => o -> QA -> IO (Maybe String)
+        history_requires_rerun _ o (Oracle td bs_q bs_a) = 
             case peekOracle td bs_q bs_a of
                 Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
                 Just (question, old_answer) -> do
                   new_answer <- queryOracle o question
                   return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-        history_requires_rerun _ (Need nested_fps_times) = do
+        history_requires_rerun blocks_fps _ (Need nested_fps_times) = do
             let (nested_fps, nested_old_times) = unzip nested_fps_times
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
             -- so we recursively invoke need in order to check if we have any changes
-            -- TODO: we might get infinite recursion here
-            nested_new_times <- need' e nested_fps
+            nested_new_times <- need' (e { ae_blocks_fps = blocks_fps ++ ae_blocks_fps e }) nested_fps
             let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
             return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                 \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
     
-        find_all_rules pending_cleans pending_uncleans [] db = do
+        find_all_rules pending_cleans pending_uncleans [] _ db = do
             -- Display a helpful message to the user explaining the rules that we have decided upon:
             let all_creates_fps = [creates_fp | (_, creates_fps, _) <- pending_uncleans, creates_fp <- creates_fps]
             when (not (null pending_uncleans) && verbosity >= ChattyVerbosity) $
@@ -489,15 +494,15 @@ need' e init_fps = do
             
             -- The rule-running code doesn't need to know *all* the files created by a rule run
             return (db, (pending_cleans, [(unclean_fps, rule) | (unclean_fps, _, rule) <- pending_uncleans]))
-        find_all_rules pending_cleans pending_uncleans (fp:fps) db = do
+        find_all_rules pending_cleans pending_uncleans (fp:fps) blocks_fps db = do
             let ei_unclean_clean = case M.lookup fp db of
                   Nothing                     -> Left Nothing
                   Just (Dirty hist)           -> Left (Just hist)
                   Just (Clean _ _)            -> Right Nothing
-                  Just (Building _ wait_mvar) -> Right (Just wait_mvar) -- TODO: detect dependency cycles through Building
+                  Just (Building _ wait_mvar) -> Right (Just wait_mvar)
             
             case ei_unclean_clean of
-                Right mb_mvar -> find_all_rules ((fp, mb_mvar) : pending_cleans) pending_uncleans fps db
+                Right mb_mvar -> find_all_rules ((fp, mb_mvar) : pending_cleans) pending_uncleans fps blocks_fps db
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
@@ -520,9 +525,10 @@ need' e init_fps = do
                     -- NB: people wanting *any* of the files created by this rule should wait on the same WaitHandle
                     wait_handle <- newWaitHandle
                     db <- return $ foldr (\potential_creates_fp db -> M.insert potential_creates_fp (Building mb_hist wait_handle) db) db potential_creates_fps
+                    blocks_fps <- return $ potential_creates_fps ++ blocks_fps
     
                     (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
-                                                                        Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun potential_o) hist
+                                                                        Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun blocks_fps potential_o) hist
                     mb_clean_hist <- case ei_clean_hist_dirty_reason of
                       Left clean_hist -> return (Just clean_hist)
                       Right dirty_reason -> do
@@ -530,7 +536,13 @@ need' e init_fps = do
                         return Nothing
                   
                     let (creates_fps, basic_rule) = case mb_clean_hist of
-                          Nothing         -> (potential_creates_fps, potential_rule e)
+                          -- Each rule we execute will block the creation of some files if it waits. In particular, it blocks the
+                          -- creation the files it *directly outputs*, and those files that will be created by the caller in the future
+                          -- after our file is created and we return.
+                          --
+                          -- Note that a rule waiting *does not* block the creation of files built by other rules. This is because everything
+                          -- gets executed in parallel.
+                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_blocks_fps = potential_creates_fps ++ ae_blocks_fps e }))
                           Just clean_hist -> ([fp], do
                             nested_time <- get_clean_mod_time fp
                             return (clean_hist, [(fp, nested_time)]))
@@ -547,14 +559,14 @@ need' e init_fps = do
                     -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
                     --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
                     let (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
-                    find_all_rules pending_cleans ((fp : next_fps_satisifed_here, creates_fps, rule) : pending_uncleans) fps' db
+                    find_all_rules pending_cleans ((fp : next_fps_satisifed_here, creates_fps, rule) : pending_uncleans) fps' blocks_fps db
     
     -- Figure out the rules we need to use to create all the dirty files we need
     --
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff).
     -- When we have to recursively invoke need, we put back into the MVar before doing so.
-    (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps
+    (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps []
     
     -- Run the rules we have decided upon in parallel
     unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> do
@@ -568,8 +580,16 @@ need' e init_fps = do
         case mb_wait_handle of
           Nothing -> return ()
           Just wait_handle -> do
-            -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked
-            -- NB: it is safe to use isEmptyMVar here because once the wait MVar is filled it will never be emptied
+            -- NB: Waiting on the handle leads to a deadlock iff the worker responsible for triggering that wait handle
+            -- eventually waits on one of the init_blocks_fps.
+            --
+            -- TODO: implement a less rubbish deadlock detector based on this observation.
+            -- One possible scheme:
+            --  1) Add the init_blocks_fps to the WaitHandle somehow just before waiting on it
+            --  2) Check if the wait handle has FilePaths attached that I am responsible for triggering in the future just before waiting on it
+            when (clean_fp `elem` ae_blocks_fps e) $ shakefileError $ "Cyclic dependency detected: the file " ++ clean_fp ++ " depended on itself in a chain involving (some of) " ++ showStringList (ae_blocks_fps e)
+            
+            -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
             may_wait <- mayWaitOnWaitHandle wait_handle
             when may_wait $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
