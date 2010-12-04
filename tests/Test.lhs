@@ -51,7 +51,8 @@ main = do
     withCurrentDirectory "simple-c" $ do
         clean [".openshake-db", "Main", "main.o", "constants.h"]
         
-        -- NB: the first time around is a clean build, the second time we have to rebuild even though we already have Main
+        -- 1) Try a normal build. The first time around is a clean build, the second time we
+        --    have to rebuild even though we already have Main:
         forM_ [42, 43] $ \constant -> do
             writeFile "constants.h" $ "#define MY_CONSTANT " ++ show constant
             
@@ -61,13 +62,18 @@ main = do
             out <- readProcess "./Main" [] ""
             ("The magic number is " ++ show constant ++ "\n") `assertEqualM` out
         
-        -- One last run, without changing any files, to make sure that nothing gets spuriously rebuilt:
+        -- 2) Run without changing any files, to make sure that nothing gets spuriously rebuilt:
         let interesting_files = ["Main", "main.o"]
         old_mtimes <- mapM getModificationTime interesting_files
         ec <- shake
         ExitSuccess `assertEqualM` ec
         new_mtimes <- mapM getModificationTime interesting_files
         old_mtimes `assertEqualM` new_mtimes
+        
+        -- 3) Corrupt the database and check that Shake recovers
+        writeFile ".openshake-db" "Junk!"
+        ec <- shake
+        ExitSuccess `assertEqualM` ec
 
     withCurrentDirectory "cyclic" $ do
         ec <- shake
