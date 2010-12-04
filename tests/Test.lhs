@@ -10,8 +10,14 @@ import Control.Monad
 import System.Environment
 import System.Directory
 import System.Exit
+import System.FilePath
 import System.Process
 import System.Timeout
+
+import System.IO.Temp
+
+import Debug.Trace
+
 
 withCurrentDirectory :: FilePath -> IO a -> IO a
 withCurrentDirectory new_cwd act = Exception.bracket (do { old_cwd <- getCurrentDirectory; setCurrentDirectory new_cwd; return old_cwd }) setCurrentDirectory (\_ -> act)
@@ -19,6 +25,22 @@ withCurrentDirectory new_cwd act = Exception.bracket (do { old_cwd <- getCurrent
 isExitFailure :: ExitCode -> Bool
 isExitFailure (ExitFailure _) = True
 isExitFailure _ = False
+
+doWhile_ :: IO a -> IO Bool -> IO ()
+doWhile_ what test = go
+  where go = what >> test >>= \b -> if b then go else return ()
+
+removeFileIfExists :: FilePath -> IO ()
+removeFileIfExists fp = doesFileExist fp >>= \exists -> when exists (removeFile fp)
+
+touch :: FilePath -> IO ()
+touch fp = runProcess "touch" [fp] Nothing Nothing Nothing Nothing Nothing >>= waitForProcess >> return ()
+
+ms = (*1000)
+seconds = (*1000000)
+
+traceShowM :: (Monad m, Show a) => m a -> m a
+traceShowM mx = mx >>= \x -> trace (show x) (return x)
 
 
 assertEqualM :: (Eq a, Show a, Monad m) => a -> a -> m ()
@@ -28,7 +50,7 @@ assertIsM :: (Show a, Monad m) => (a -> Bool) -> a -> m ()
 assertIsM expectation actual = if expectation actual then return () else fail $ show actual ++ " did not match our expectations"
 
 clean :: [FilePath] -> IO ()
-clean = mapM_ (\fp -> doesFileExist fp >>= \exists -> when exists (removeFile fp))
+clean = mapM_ removeFileIfExists
 
 -- | Allows us to timeout even blocking that is not due to the Haskell RTS, by running the action to time out on
 -- another thread.
@@ -43,14 +65,43 @@ shake = do
     extra_args <- getArgs -- NB: this is a bit of a hack!
     
     ph <- runProcess "runghc" (["-i../../", "Shakefile.hs"] ++ extra_args) Nothing Nothing Nothing Nothing Nothing
-    let seconds = (*1000000)
-    mb_ec <- timeoutForeign (seconds 10) (terminateProcess ph) $ waitForProcess ph
+    mb_ec <- timeoutForeign (seconds 5) (terminateProcess ph) $ waitForProcess ph
     case mb_ec of
       Nothing -> error "shake took too long to run!"
       Just ec -> return ec
 
+-- | Shake can only detect changes that are reflected by changes to the modification time.
+-- Thus if we expect a rebuild we need to wait for the modification time used by the system to actually change.
+waitForModificationTimeToChange :: IO ()
+waitForModificationTimeToChange = withSystemTempDirectory "openshake-test" $ \tmpdir -> do
+    let testfile = tmpdir </> "modtime.txt"
+    writeFile testfile ""
+    init_mod_time <- getModificationTime testfile
+    mb_unit <- timeout (seconds 5) $ (threadDelay (seconds 1) >> writeFile testfile "") `doWhile_` (fmap (== init_mod_time) (getModificationTime testfile))
+    case mb_unit of
+      Nothing -> error "The modification time doesn't seem to be changing"
+      Just () -> return ()
+
+mtimeSanityCheck :: IO ()
+mtimeSanityCheck = flip Exception.finally (removeFileIfExists "delete-me") $ do
+    writeFile "delete-me" ""
+    mtime1 <- getModificationTime "delete-me"
+    threadDelay (seconds 2)
+    
+    writeFile "delete-me" ""
+    mtime2 <- getModificationTime "delete-me"
+    threadDelay (seconds 2)
+    
+    touch "delete-me"
+    mtime3 <- getModificationTime "delete-me"
+    threadDelay (seconds 2)
+    
+    True `assertEqualM` (mtime1 /= mtime2 && mtime2 /= mtime3 && mtime1 /= mtime3)
+
 main :: IO ()
 main = do
+    mtimeSanityCheck
+    
     withCurrentDirectory "simple-c" $ do
         clean [".openshake-db", "Main", "main.o", "constants.h"]
         
@@ -64,6 +115,8 @@ main = do
         
             out <- readProcess "./Main" [] ""
             ("The magic number is " ++ show constant ++ "\n") `assertEqualM` out
+            
+            waitForModificationTimeToChange
         
         -- 2) Run without changing any files, to make sure that nothing gets spuriously rebuilt:
         let interesting_files = ["Main", "main.o"]
