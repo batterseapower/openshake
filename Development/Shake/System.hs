@@ -17,31 +17,31 @@ import System.Directory
 import System.FilePath
 
 
-system' :: [String] -> Act ()
+system' :: [String] -> Act o ()
 system' prog = do
     ec <- system prog
     Utilities.checkExitCode prog ec
 
-system :: [String] -> Act ExitCode
+system :: [String] -> Act o ExitCode
 system prog = do
     putStrLnAt VerboseVerbosity cmd
     liftIO $ Process.system cmd
   where cmd = intercalate " " prog
 
-systemStdout' :: [String] -> Act String
+systemStdout' :: [String] -> Act o String
 systemStdout' prog = do
     (ec, stdout) <- systemStdout prog
     Utilities.checkExitCode prog ec
     return stdout
 
-systemStdout :: [String] -> Act (ExitCode, String)
+systemStdout :: [String] -> Act o (ExitCode, String)
 systemStdout prog = do
     putStrLnAt VerboseVerbosity cmd
     liftIO $ Utilities.systemStdout cmd
   where cmd = intercalate " " prog
 
 
-readFileLines :: FilePath -> Act [String]
+readFileLines :: FilePath -> Act o [String]
 readFileLines x = do
     need [x]
     liftIO $ fmap lines $ readFile x
@@ -49,11 +49,11 @@ readFileLines x = do
 quote :: String -> String
 quote x = "\"" ++ x ++ "\"" -- TODO: this is probably wrong
 
-copy :: FilePath -> FilePath -> Act ()
+copy :: FilePath -> FilePath -> Act o ()
 copy from to = do
     mkdir $ takeDirectory to
     need [from]
     system' ["cp", quote from, quote to]
 
-mkdir :: FilePath -> Act ()
+mkdir :: FilePath -> Act o ()
 mkdir fp = liftIO $ createDirectoryIfMissing True fp

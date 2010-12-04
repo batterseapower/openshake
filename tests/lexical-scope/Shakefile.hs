@@ -3,9 +3,9 @@ import Development.Shake
 
 main :: IO ()
 main = shake $ do
-    oracle (const ["foo"]) $
+    stringOracle (const $ return ["foo"]) $
       "examplefile" *> \x -> do
-          ["foo"] <- query ("silly", "question")
+          ["foo"] <- queryStringOracle ("silly", "question")
           return ()
-    oracle (const ["bar"]) $ 
+    stringOracle (const $ return ["bar"]) $ 
         want ["examplefile"]
