@@ -87,7 +87,7 @@ type CreatesFiles = [FilePath]
 type Rule = FilePath -> Maybe (CreatesFiles, Act ())
 
 data ShakeState = SS {
-    ss_rules :: [Rule]
+    ss_rules :: [(Oracle, Rule)]
   }
 
 data ShakeEnv = SE {
@@ -216,8 +216,9 @@ data ActState = AS {
   }
 
 data ActEnv = AE {
+    ae_oracle :: Oracle, -- NB: Act *should not* access the Oracle from the ShakeEnv, because that is the "dynamically scoped" one
     ae_global_env :: ShakeEnv,
-    ae_global_rules :: [Rule]
+    ae_global_rules :: [(Oracle, Rule)]
   }
 
 newtype Act a = Act { unAct :: Reader.ReaderT ActEnv (State.StateT ActState IO) a }
@@ -294,7 +295,7 @@ want :: [FilePath] -> Shake ()
 want fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_env = e }) (AS { as_this_history = [] }) (need fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_global_rules = ss_rules s, ae_global_env = e, ae_oracle = internalError "Act oracle used before it was installed" }) (AS { as_this_history = [] }) (need fps)
     return ()
 
 (*>) :: String -> (FilePath -> Act ()) -> Shake ()
@@ -319,7 +320,16 @@ want fps = do
 
 
 addRule :: Rule -> Shake ()
-addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
+addRule rule = do
+    -- NB: we store the oracle with the rule to implement "lexical scoping" for oracles.
+    -- Basically, the oracle in effect when we run some rules action should be the oracle
+    -- lexically above at the time the rule was created. Thus, we form the "lexical closure"
+    -- of the oracle with the added rule.
+    --
+    -- Note the contrast with using the oracle from the point at which need was called to
+    -- invoke the rule, which is more akin to a dynamic scoping scheme.
+    o <- fmap se_oracle $ askShakeEnv
+    modifyShakeState $ \s -> s { ss_rules = (o, rule) : ss_rules s }
 
 need :: [FilePath] -> Act ()
 need fps = do
@@ -339,11 +349,11 @@ need' e init_fps = do
     let -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
         -- of the rule have not changed
-        history_requires_rerun :: QA -> IO (Maybe String)
-        history_requires_rerun (Oracle question old_answer) = do
-            let new_answer = se_oracle (ae_global_env e) question
+        history_requires_rerun :: Oracle -> QA -> IO (Maybe String)
+        history_requires_rerun o (Oracle question old_answer) = do
+            let new_answer = o question
             return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-        history_requires_rerun (Need nested_fps_times) = do
+        history_requires_rerun _ (Need nested_fps_times) = do
             let (nested_fps, nested_old_times) = unzip nested_fps_times
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
             -- so we recursively invoke need in order to check if we have any changes
@@ -374,7 +384,7 @@ need' e init_fps = do
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-                  (potential_creates_fps, potential_rule) <- findRule (ae_global_rules e) fp
+                  (potential_o, potential_creates_fps, potential_rule) <- findRule (ae_global_rules e) fp
     
                   -- 1) Basic sanity check that the rule creates the file we actually need
                   unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ fp ++ " but claims not to create it, only the files " ++ showStringList potential_creates_fps
@@ -396,7 +406,7 @@ need' e init_fps = do
                   db <- return $ foldr (\potential_creates_fp db -> M.insert potential_creates_fp (Building mb_hist wait_handle) db) db potential_creates_fps
     
                   (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
-                                                                      Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map history_requires_rerun hist
+                                                                      Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun potential_o) hist
                   mb_clean_hist <- case ei_clean_hist_dirty_reason of
                     Left clean_hist -> return (Just clean_hist)
                     Right dirty_reason -> do
@@ -461,10 +471,10 @@ appendHistory :: QA -> Act ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-findRule :: [Rule] -> FilePath -> IO (CreatesFiles, ActEnv -> IO (History, [(FilePath, ModTime)]))
-findRule rules fp = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
-  [(creates_fps, action)] -> return (creates_fps, \e -> do
-      ((), final_nested_s) <- runAct e (AS { as_this_history = [] }) action
+findRule :: [(Oracle, Rule)] -> FilePath -> IO (Oracle, CreatesFiles, ActEnv -> IO (History, [(FilePath, ModTime)]))
+findRule rules fp = case [(o, creates_fps, action) | (o, rule) <- rules, Just (creates_fps, action) <- [rule fp]] of
+  [(o, creates_fps, action)] -> return (o, creates_fps, \e -> do
+      ((), final_nested_s) <- runAct (e { ae_oracle = o }) (AS { as_this_history = [] }) action
       
       creates_times <- forM creates_fps $ \creates_fp -> do
           nested_time <- fmap (fromMaybe $ shakefileError $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
@@ -475,7 +485,9 @@ findRule rules fp = case [(creates_fps, action) | rule <- rules, Just (creates_f
       mb_nested_time <- getFileModTime fp
       case mb_nested_time of
           Nothing          -> shakefileError $ "No rule to build " ++ fp
-          Just nested_time -> return ([fp], \_ -> return ([], [(fp, nested_time)])) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+          -- TODO: this fake oracle is probably reachable if we change from having a rule for a file to not having one,
+          -- but the file existing. In that case we will try to recheck the old oracle answers against our Error!
+          Just nested_time -> return (internalError "Accessed fake oracle for rule to build existing file", [fp], \_ -> return ([], [(fp, nested_time)])) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
   _actions -> shakefileError $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 type Question = (String,String)
@@ -500,11 +512,11 @@ type Oracle = Question -> Answer
 -- TODO: oracle polymorphism
 -- TODO: supply old oracle to the new oracle function
 oracle :: Oracle -> Shake a -> Shake a
-oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: some way to combine with previous oracle?
+oracle o = localShakeEnv (\e -> e { se_oracle = o }) -- TODO: some way to combine with previous oracle?
 
 query :: Question -> Act Answer
 query question = do
     e <- askActEnv
-    let answer = se_oracle (ae_global_env e) question
+    let answer = ae_oracle e question
     appendHistory $ Oracle question answer
     return answer

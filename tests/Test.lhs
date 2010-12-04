@@ -102,6 +102,12 @@ main :: IO ()
 main = do
     mtimeSanityCheck
     
+    withCurrentDirectory "lexical-scope" $ do
+        clean [".openshake-db"]
+        
+        ec <- shake
+        ExitSuccess `assertEqualM` ec
+    
     withCurrentDirectory "simple-c" $ do
         clean [".openshake-db", "Main", "main.o", "constants.h"]
         
@@ -132,6 +138,8 @@ main = do
         ExitSuccess `assertEqualM` ec
 
     withCurrentDirectory "cyclic" $ do
+        clean [".openshake-db"]
+        
         ec <- shake
         isExitFailure `assertIsM` ec
 
