@@ -63,7 +63,7 @@ import GHC.Conc (numCapabilities)
 -- 3: Verbose
 -- 4: Chatty
 data Verbosity = SilentVerbosity | QuietVerbosity | NormalVerbosity | VerboseVerbosity | ChattyVerbosity
-               deriving (Enum, Bounded, Eq, Ord)
+               deriving (Show, Enum, Bounded, Eq, Ord)
 
 
 snocView :: [a] -> Maybe ([a], a)
@@ -322,6 +322,7 @@ addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 need :: [FilePath] -> Act ()
 need fps = do
     e <- askActEnv
+    verbosity <- actVerbosity
     
     let get_clean_mod_time fp = fmap (expectJust ("The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
@@ -336,17 +337,24 @@ need fps = do
               | fp <- fps
               ]
         
+            history_requires_rerun :: QA -> IO (Maybe String)
             history_requires_rerun (Oracle question old_answer) = do
                 let new_answer = se_oracle (ae_global_env e) question
-                return (old_answer /= new_answer)
-            history_requires_rerun (Need nested_fps) = flip anyM nested_fps $ \(fp, old_time) -> do
+                return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
+            history_requires_rerun (Need nested_fps) = flip firstJustM nested_fps $ \(fp, old_time) -> do
                 new_time <- getFileModTime fp
-                return (Just old_time /= new_time)
+                return $ guard (Just old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
             find_all_rules [] = return []
             find_all_rules ((unclean_fp, mb_hist):uncleans) = do
-                mb_clean_hist <- case mb_hist of Nothing   -> return Nothing
-                                                 Just hist -> fmap (? (Nothing, Just hist)) $ anyM history_requires_rerun hist
+                mb_clean_hist <- do
+                    ei_clean_hist_dirty_reason <- case mb_hist of Nothing   -> return (Right "file was not in the database")
+                                                                  Just hist -> fmap (maybe (Left hist) Right) $ firstJustM history_requires_rerun hist
+                    case ei_clean_hist_dirty_reason of
+                      Left clean_hist -> return (Just clean_hist)
+                      Right dirty_reason -> do
+                        when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ unclean_fp ++ " because " ++ dirty_reason
+                        return Nothing
                 (creates_fps, rule) <- case mb_clean_hist of
                   Nothing         -> findRule (ae_global_rules e) unclean_fp
                   Just clean_hist -> return ([unclean_fp], \_ -> do
@@ -452,6 +460,9 @@ putAnswer = putList putUTF8String
 
 type Oracle = Question -> Answer
 
+-- TODO: lexically scoped semantics for the oracle
+-- TODO: oracle polymorphism
+-- TODO: supply old oracle to the new oracle function
 oracle :: Oracle -> Shake a -> Shake a
 oracle new_oracle = localShakeEnv (\e -> e { se_oracle = new_oracle }) -- TODO: some way to combine with previous oracle?
 

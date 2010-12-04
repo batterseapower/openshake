@@ -46,6 +46,13 @@ anyM p = go
             if b then return True
                  else go xs
 
+firstJustM :: Monad m => (a -> m (Maybe b)) -> [a] -> m (Maybe b)
+firstJustM f = go
+  where go []     = return Nothing
+        go (x:xs) = do
+            mb_y <- f x
+            maybe (go xs) (return . Just) mb_y
+
 replicateM :: Monad m => Int -> m b -> m [b]
 replicateM = genericReplicateM
 
