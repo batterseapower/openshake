@@ -13,7 +13,10 @@ module Development.Shake (
     Act, need, query,
     
     -- * Oracles, the default oracle and wrappers for the questions it can answer
-    Oracle(..), StringOracle(..), defaultOracle, stringOracle, queryStringOracle, ls
+    Oracle(..), StringOracle(..), defaultOracle, stringOracle, queryStringOracle, ls,
+    
+    -- * Used to add commands to the shake report
+    reportCommand
   ) where
 
 import Development.Shake.WaitHandle
@@ -47,6 +50,7 @@ import Control.Monad.IO.Class
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
+import Data.Ord
 import Data.List
 import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
 
@@ -91,7 +95,7 @@ internalError s = error $ "Internal Shake error: " ++ s
 
 
 runGetAll :: Get a -> BS.ByteString -> a
-runGetAll get bs = case runGetState get bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
+runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
 
 
 type CreatesFiles = [FilePath]
@@ -341,6 +345,10 @@ shake mx = withPool numCapabilities $ \pool -> do
     report_mvar <- emptyReportDatabase >>= newMVar
     
     ((), _final_s) <- runShake (SE { se_database = db_mvar, se_wait_database = wdb_mvar, se_report = report_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
+    
+    -- TODO: put report under command-line control
+    final_report <- takeMVar report_mvar
+    writeFile "openshake-report.html" (produceReport final_report)
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -595,7 +603,11 @@ need' e init_fps = do
     (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps []
     
     -- Run the rules we have decided upon in parallel
-    unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (se_report (ae_global_env e)) $ do
+    --
+    -- NB: we report that the thread using parallel is blocked because it may go on to actually
+    -- execute one of the parallel actions, which will bump the parallelism count without any
+    -- extra parallelism actually occuring.
+    unclean_times <- fmap concat $ reportWorkerBlocked (se_report (ae_global_env e)) $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (se_report (ae_global_env e)) $ do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
@@ -692,6 +704,7 @@ registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.
 
 
 data ReportDatabase = RDB {
+    rdb_observed_commands :: [(String, NominalDiffTime)],
     rdb_observed_concurrency :: [(UTCTime, Int)],
     rdb_concurrency :: Int,
     rdb_start_at :: UTCTime
@@ -701,6 +714,7 @@ emptyReportDatabase :: IO ReportDatabase
 emptyReportDatabase = do
     ts <- getCurrentTime
     return $ RDB {
+        rdb_observed_commands = [],
         rdb_observed_concurrency = [(ts, 1)],
         rdb_concurrency = 1,
         rdb_start_at = ts
@@ -714,23 +728,54 @@ reportConcurrencyBump :: Int -> MVar ReportDatabase -> IO a -> IO a
 reportConcurrencyBump bump mvar_rdb act = Exception.bracket (bump_concurrency bump) (\() -> bump_concurrency (negate bump)) (\() -> act)
   where bump_concurrency directed_bump = modifyMVar_ mvar_rdb $ \rdb -> getCurrentTime >>= \ts -> return $ rdb { rdb_concurrency = rdb_concurrency rdb + directed_bump, rdb_observed_concurrency = (ts, rdb_concurrency rdb - directed_bump) : rdb_observed_concurrency rdb }
 
-finaliseReport :: ReportDatabase -> String
-finaliseReport rdb = "<html><head><title>OpenShake report</title></head><body><h1>Parallelism Report</h1><img src=\"" ++ googleChartURL (600, 200) concurrency_xy ++ "\" /></body></html>"
-  where concurrency_xy = [(realToFrac (time `diffUTCTime` rdb_start_at rdb) :: Double, concurrency) | (time, concurrency) <- rdb_observed_concurrency rdb]
+reportCommand :: String -> IO a -> Act o a
+reportCommand cmd act = do
+    mvar_rdb <- fmap (se_report . ae_global_env) askActEnv
+    liftIO $ reportCommandIO mvar_rdb cmd act
+
+reportCommandIO :: MVar ReportDatabase -> String -> IO a -> IO a
+reportCommandIO mvar_rdb cmd act = do
+    start_ts <- getCurrentTime
+    res <- act
+    end_ts <- getCurrentTime
+    
+    modifyMVar_ mvar_rdb $ \rdb -> return $ rdb { rdb_observed_commands = (cmd, end_ts `diffUTCTime` start_ts) : rdb_observed_commands rdb }
+    return res
+
+produceReport :: ReportDatabase -> String
+produceReport rdb = "<html><head><title>OpenShake report</title></head><body>" ++
+                    "<h1>Parallelism over time</h1>" ++ parallelism ++
+                    "<h1>Long-running commands</h1><table><tr><th>Command</th><th>Time</th></tr>" ++ long_running_commands ++ "</table>" ++
+                    "</body></html>"
+  where
+    -- TODO: encode string suitably for enclosing in quotes in attribute
+    attributeEncode = id
+    -- TODO: encode string suitably for using as text in HTML
+    htmlEncode = id
+    
+    parallelism = "<img src=\"" ++ attributeEncode (concurrencyChartURL (600, 200) concurrency_xy) ++ "\" />"
+    -- NB: concurrency sometimes becomes negative for very small periods of time. We should probably filter these out, but
+    -- for now I'll just make them to 0. It is essential that we don't let values like -1 get into the chart data sent to
+    -- Google, because Charts interprets a y-range minimum of -1 as "no minimum"...
+    concurrency_xy = [ (realToFrac (time `diffUTCTime` rdb_start_at rdb) :: Double, 0 `max` concurrency)
+                     | (time, concurrency) <- reverse $ rdb_observed_concurrency rdb]
+    
+    long_running_commands = unlines ["<tr><td>" ++ htmlEncode cmd ++ "</td><td>" ++ htmlEncode (show runtime) ++ "</td></tr>" | (cmd, runtime) <- command_data]
+    command_data = take 50 $ reverse $ sortBy (comparing snd) $ rdb_observed_commands rdb
 
 -- See <http://code.google.com/apis/chart/docs/data_formats.html>, <http://code.google.com/apis/chart/docs/chart_params.html>
-googleChartURL :: (Ord a, Ord b, Num a, Num b) => (Int, Int) -> [(a, b)] -> String
-googleChartURL (width, height) xys
-  = "http://chart.apis.google.com/chart?cht=lxy&chd=t:" ++ encode xs ++ "|" ++ encode ys ++
-    "&chds=" ++ range xs ++ "," ++ range ys ++              -- Setup data range for the text encoding
-    "&chxt=x,y&chxr=0," ++ range xs ++ "|1," ++ range ys ++ -- Setup axis range
-    "&chco=3674FB" ++                                       -- Color of line
-    "&chm=B,76A4FB,0,0,0" ++                                -- Color underneath the drawn line
-    "&chs=" ++ show width ++ "x" ++ show height             -- Image size
+concurrencyChartURL :: (Int, Int) -> [(Double, Int)] -> String
+concurrencyChartURL (width, height) xys
+  = "http://chart.apis.google.com/chart?cht=lxy&chd=t:" ++ encode_series xs ++ "|" ++ encode_series ys ++
+    "&chds=" ++ range xs ++ "," ++ range ys ++                  -- Setup data range for the text encoding
+    "&chxt=x,y&chxr=0," ++ range xs ++ "|1," ++ range (0:ys) ++ -- Setup axis range (we force the y axis to start at 0 even if minimum parallelism was 1)
+    "&chco=3674FB" ++                                           -- Color of line
+    "&chm=B,76A4FB,0,0,0" ++                                    -- Color underneath the drawn line
+    "&chs=" ++ show width ++ "x" ++ show height                 -- Image size
   where (xs, ys) = unzip xys
         
-        encode :: Show a => [a] -> String
-        encode = intercalate "," . map show
+        encode_series :: Show a => [a] -> String
+        encode_series = intercalate "," . map show
         
         range :: (Ord a, Show a) => [a] -> String
         range zs = show (minimum zs) ++ "," ++ show (maximum zs)

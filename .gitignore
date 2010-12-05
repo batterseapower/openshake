@@ -2,8 +2,9 @@
 Thumbs.db
 .DS_Store
 
-# Shake database
+# Shake generated files
 .openshake-db
+openshake-report.html
 
 # Build artifacts
 dist/

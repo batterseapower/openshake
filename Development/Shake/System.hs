@@ -25,7 +25,7 @@ system' prog = do
 system :: [String] -> Act o ExitCode
 system prog = do
     putStrLnAt VerboseVerbosity cmd
-    liftIO $ Process.system cmd
+    reportCommand cmd $ Process.system cmd
   where cmd = intercalate " " prog
 
 systemStdout' :: [String] -> Act o String
@@ -37,7 +37,7 @@ systemStdout' prog = do
 systemStdout :: [String] -> Act o (ExitCode, String)
 systemStdout prog = do
     putStrLnAt VerboseVerbosity cmd
-    liftIO $ Utilities.systemStdout cmd
+    reportCommand cmd $ Utilities.systemStdout cmd
   where cmd = intercalate " " prog
 
 
