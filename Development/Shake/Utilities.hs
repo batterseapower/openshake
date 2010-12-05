@@ -39,6 +39,11 @@ lookupMany missing_error ks init_kvs
   = mapAccumL (\kvs k -> case lookupRemove k kvs of Nothing -> missing_error k
                                                     Just (v, kvs') -> (kvs', (k, v))) init_kvs ks
 
+fixEq :: Eq a => (a -> a) -> a -> a
+fixEq f x | x == x'   = x
+          | otherwise = fixEq f x'
+  where x' = f x
+
 anyM :: Monad m => (a -> m Bool) -> [a] -> m Bool
 anyM p = go
   where go []     = return False

@@ -101,7 +101,7 @@ data ShakeState = SS {
 
 data ShakeEnv o = SE {
     se_database :: Database,
-    se_waiting_upon :: MVar WaitDatabase,
+    se_wait_database :: MVar WaitDatabase,
     se_pool :: Pool,
     se_oracle :: o,
     se_verbosity :: Verbosity
@@ -110,7 +110,7 @@ data ShakeEnv o = SE {
 instance Functor ShakeEnv where
     fmap f se = SE {
         se_database = se_database se,
-        se_waiting_upon = se_waiting_upon se,
+        se_wait_database = se_wait_database se,
         se_pool = se_pool se,
         se_oracle = f (se_oracle se),
         se_verbosity = se_verbosity se
@@ -260,8 +260,11 @@ data ActState = AS {
   }
 
 data ActEnv o = AE {
-    ae_oracle :: o, -- NB: Act *should not* (and cannot, thanks to the type system) access the Oracle from the ShakeEnv, because that is the "dynamically scoped" one
-    ae_blocks_fps :: [WaitHandle],
+    ae_oracle :: o, -- ^ The oracle for the 'Act' to use when querying. Note that we should not (and cannot, thanks to
+                    --   the type system) access the oracle from the 'ShakeEnv', because that is the "dynamically scoped" one
+                    --   that just happens to be in scope at the time we "need" a file, not the one in scope when the rule was created.
+    ae_would_block_handles :: [WaitHandle], -- ^ A list of handles that would be incapable of awakening if the action were to
+                                            --   block indefinitely here and now. This is used in the deadlock detector.
     ae_global_env :: ShakeEnv (),
     ae_global_rules :: [SomeRule]
   }
@@ -269,7 +272,7 @@ data ActEnv o = AE {
 instance Functor ActEnv where
     fmap f ae = AE {
         ae_oracle = f (ae_oracle ae),
-        ae_blocks_fps = ae_blocks_fps ae,
+        ae_would_block_handles = ae_would_block_handles ae,
         ae_global_env = ae_global_env ae,
         ae_global_rules = ae_global_rules ae
       }
@@ -328,9 +331,9 @@ shake mx = withPool numCapabilities $ \pool -> do
     when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
-    waiting_upon <- newMVar (WDB 0 [])
+    wdb_mvar <- newMVar emptyWaitDatabase
     
-    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_waiting_upon = waiting_upon, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
+    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_wait_database = wdb_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -415,7 +418,7 @@ want :: [FilePath] -> Shake o ()
 want fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_blocks_fps = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need fps)
     return ()
 
 (*>) :: Oracle o => String -> (FilePath -> Act o ()) -> Shake o ()
@@ -454,10 +457,6 @@ addRule rule = do
 need :: [FilePath] -> Act o ()
 need fps = do
     e <- askActEnv
-    -- NB: the initial list of blocked files is empty because whenever need is invoked (via runAct on a rule),
-    -- the rule runs that will create the other files are already setup to run in parallel
-    -- FIXME: an parallel Act execution blocks *its own file* from being created if it waits on a WaitHandle.
-    -- Must take account of that!
     need_times <- liftIO $ need' e fps
     appendHistory $ Need need_times
 
@@ -480,11 +479,11 @@ need' e init_fps = do
                 Just (question, old_answer) -> do
                   new_answer <- queryOracle o question
                   return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-        history_requires_rerun blocks_fps _ (Need nested_fps_times) = do
+        history_requires_rerun would_block_handles _ (Need nested_fps_times) = do
             let (nested_fps, nested_old_times) = unzip nested_fps_times
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
             -- so we recursively invoke need in order to check if we have any changes
-            nested_new_times <- need' (e { ae_blocks_fps = blocks_fps ++ ae_blocks_fps e }) nested_fps
+            nested_new_times <- need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
             let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
             return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                 \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
@@ -498,7 +497,7 @@ need' e init_fps = do
             
             -- The rule-running code doesn't need to know *all* the files created by a rule run
             return (db, (pending_cleans, [(unclean_fps, rule) | (unclean_fps, _, rule) <- pending_uncleans]))
-        find_all_rules pending_cleans pending_uncleans (fp:fps) blocks_fps db = do
+        find_all_rules pending_cleans pending_uncleans (fp:fps) would_block_handles db = do
             let ei_unclean_clean = case M.lookup fp db of
                   Nothing                     -> Left Nothing
                   Just (Dirty hist)           -> Left (Just hist)
@@ -506,7 +505,7 @@ need' e init_fps = do
                   Just (Building _ wait_mvar) -> Right (Just wait_mvar)
             
             case ei_unclean_clean of
-                Right mb_mvar -> find_all_rules ((fp, mb_mvar) : pending_cleans) pending_uncleans fps blocks_fps db
+                Right mb_mvar -> find_all_rules ((fp, mb_mvar) : pending_cleans) pending_uncleans fps would_block_handles db
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
@@ -529,10 +528,12 @@ need' e init_fps = do
                     -- NB: people wanting *any* of the files created by this rule should wait on the same WaitHandle
                     wait_handle <- newWaitHandle
                     db <- return $ foldr (\potential_creates_fp db -> M.insert potential_creates_fp (Building mb_hist wait_handle) db) db potential_creates_fps
-                    blocks_fps <- return $ wait_handle : blocks_fps
+                    
+                    -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
+                    would_block_handles <- return $ wait_handle : would_block_handles
     
                     (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
-                                                                        Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun blocks_fps potential_o) hist
+                                                                        Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun would_block_handles potential_o) hist
                     mb_clean_hist <- case ei_clean_hist_dirty_reason of
                       Left clean_hist -> return (Just clean_hist)
                       Right dirty_reason -> do
@@ -540,13 +541,13 @@ need' e init_fps = do
                         return Nothing
                   
                     let (creates_fps, basic_rule) = case mb_clean_hist of
-                          -- Each rule we execute will block the creation of some files if it waits. In particular, it blocks the
-                          -- creation the files it *directly outputs*, and those files that will be created by the caller in the future
-                          -- after our file is created and we return.
+                          -- Each rule we execute will block the creation of some files if it waits:
+                          --   * It blocks the creation the files it *directly outputs*
+                          --   * It blocks the creation of those files that will be created *by the caller* (after we return)
                           --
-                          -- Note that a rule waiting *does not* block the creation of files built by other rules. This is because everything
-                          -- gets executed in parallel.
-                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_blocks_fps = wait_handle : ae_blocks_fps e }))
+                          -- Note that any individual rule waiting *does not* block the creation of files built by other rules
+                          -- being run right. This is because everything gets executed in parallel.
+                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = wait_handle : ae_would_block_handles e }))
                           Just clean_hist -> ([fp], do
                             nested_time <- get_clean_mod_time fp
                             return (clean_hist, [(fp, nested_time)]))
@@ -563,7 +564,7 @@ need' e init_fps = do
                     -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
                     --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
                     let (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
-                    find_all_rules pending_cleans ((fp : next_fps_satisifed_here, creates_fps, rule) : pending_uncleans) fps' blocks_fps db
+                    find_all_rules pending_cleans ((fp : next_fps_satisifed_here, creates_fps, rule) : pending_uncleans) fps' would_block_handles db
     
     -- Figure out the rules we need to use to create all the dirty files we need
     --
@@ -586,24 +587,14 @@ need' e init_fps = do
           Just wait_handle -> do
             -- We can avoid a lot of fuss if the wait handle is already triggered so there can be no waiting...
             may_wait <- mayWaitOnWaitHandle wait_handle
-            when may_wait $ do
-                -- NB: Waiting on the handle leads to a deadlock iff the worker responsible for triggering that wait handle
-                -- eventually waits on one of the init_blocks_fps.
-                --
-                -- TODO: implement a less rubbish cycle detector based on this observation. The current one can fall down in situations
-                -- where we have multiple threads working, because each thread will have only part of the dependency graph.
-                -- One possible scheme:
-                --  1) Add the init_blocks_fps to the WaitHandle somehow just before waiting on it
-                --  2) Check if the wait handle has FilePaths attached that I am responsible for triggering in the future just before waiting on it
-                --FIXME: when (clean_fp `elem` ae_blocks_fps e) $ shakefileError $ "Cyclic dependency detected: the file " ++ clean_fp ++ " depended on itself in a chain involving (some of) " ++ showStringList (ae_blocks_fps e)
-
-                -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
-                registerWait (se_waiting_upon (ae_global_env e)) clean_fp wait_handle (ae_blocks_fps e) $
+            when may_wait $ registerWait (se_wait_database (ae_global_env e)) clean_fp wait_handle (ae_would_block_handles e) $
+                    -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
                     extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     return $ unclean_times ++ clean_times
 
+-- | Just a unique number to identify each update we make to the 'WaitDatabase'
 type WaitNumber = Int
 
 -- | A 'WaitHandle's that cannot be awoken because the thread that
@@ -621,33 +612,60 @@ data WaitDatabase = WDB {
     wdb_waiters :: [(WaitHandle, [BlockedWaitHandle])]
   }
 
--- FIXME: this really needs a cleanup and explanation!
--- TODO: I'm not really sure if this is correct
+emptyWaitDatabase :: WaitDatabase
+emptyWaitDatabase = WDB {
+    wdb_next_waitno = 0,
+    wdb_waiters = []
+  }
+
+-- | This function is responsible for deadlock detection.
+--
+-- The way the scheme works is that we have a global MVar containing a WaitDatabase. This database records
+-- all of the current waits in the application, along with:
+--   * The wait handles that cannot be triggered at the moment due to the outstanding wait (if any)
+--   * The reason that we are waiting at all
+--
+-- Now, before we allow the actual wait to happen we check the database of outstanding waits. If we are in
+-- a situation where there is an outstanding wait on one of the handles that would become blocked by the pending
+-- wait, and we are waiting on a handle already blocked by that outstanding wait, then we have a deadlock.
+--
+-- In this situation we throw an error instead of actually performing the wait, including in the error a descripton
+-- of the dependency chain that lead to the error reconstructed from the individual wait "why" information.
 registerWait :: MVar WaitDatabase -> FilePath -> WaitHandle -> [WaitHandle] -> IO a -> IO a
-registerWait mvar_waiting_upon new_why new_wait_handle waiting_will_block_handles act = Exception.bracket register unregister (\_ -> act)
+registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.bracket register unregister (\_ -> act)
   where
-    unregister unreg_waitno = modifyMVar_ mvar_waiting_upon (Exception.evaluate . unregister' unreg_waitno)
-    unregister' unreg_waitno wdb
-      = wdb { wdb_waiters = [(waiting_on, blocked') | (waiting_on, blocked) <- wdb_waiters wdb, let blocked' = filter (\(waitno, _, _) -> unreg_waitno /= waitno) blocked, not (null blocked')] }
-    
-    register = modifyMVar mvar_waiting_upon (Exception.evaluate . register')
-    register' (WDB next_waitno waiters)
-      = case [why_chain | (why_chain, handle) <- transitive [([new_why], handle) | handle <- waiting_will_block_handles], new_wait_handle == handle] of
+    register = modifyMVar mvar_wdb (Exception.evaluate . register')
+    register' (WDB new_waitno waiters)
+      = case [why_chain | (why_chain, handle) <- transitive [([new_why], new_will_block_handle) | new_will_block_handle <- new_will_block_handles], new_handle == handle] of
           why_chain:_ -> shakefileError $ "Cyclic dependency detected through the chain " ++ showStringList why_chain
-          []          -> (wdb', next_waitno)
+          []          -> (wdb', new_waitno)
       where
-        wdb' = WDB (next_waitno + 1) $ (new_wait_handle, [(next_waitno, new_why, waiting_will_block_handle) | waiting_will_block_handle <- waiting_will_block_handles] ++ find_blocked_wait_handles new_wait_handle) :
-                                       filter ((/= new_wait_handle) . fst) waiters
+        -- Update the database with the new waiters on this WaitHandle. We are careful to ensure that any
+        -- existing waiters on the handle are preserved and put into the same entry in the association list.
+        wdb' = WDB (new_waitno + 1) $ (new_handle, [ (new_waitno, new_why, new_will_block_handle)
+                                                   | new_will_block_handle <- new_will_block_handles ] ++
+                                                   find_blocked_wait_handles new_handle) :
+                                      filter ((/= new_handle) . fst) waiters
         
         find_blocked_wait_handles :: WaitHandle -> [BlockedWaitHandle]
         find_blocked_wait_handles wait_handle = fromMaybe [] (wait_handle `lookup` waiters)
         
-        fixEq :: Eq a => (a -> a) -> a -> a
-        fixEq f x | x == x'   = x
-                  | otherwise = fixEq f x'
-          where x' = f x
-        
-        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [(why : why_chain, new_handle) | (why_chain, handle) <- blocked, (_waitno, why, new_handle) <- find_blocked_wait_handles handle]
+        -- When we compute whether we are blocked, we need to do a transitive closure. This is necessary for situations where
+        -- e.g. A.o -> B.o -> C.o, because we need to see that A.o is waiting on C.o's WaitHandle through B.o's WaitHandle.
+        transitive :: [([FilePath], WaitHandle)] -> [([FilePath], WaitHandle)]
+        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [ (why : why_chain, next_blocked_handle)
+                                                                                         | (why_chain, blocked_handle) <- blocked
+                                                                                         , (_waitno, why, next_blocked_handle) <- find_blocked_wait_handles blocked_handle ]
+
+    -- When we have completed the wait, remove all information about it from the wait database.
+    -- Since we inserted it all with a unique integer, this is rather easy to do. To prevent the
+    -- database growing unnecessarily, we carefully remove any wdb_waiters entries that don't block
+    -- any handles at all after the removal.
+    unregister unreg_waitno = modifyMVar_ mvar_wdb (Exception.evaluate . unregister' unreg_waitno)
+    unregister' unreg_waitno wdb
+      = wdb { wdb_waiters = [(waiting_on, blocked') | (waiting_on, blocked) <- wdb_waiters wdb
+                            , let blocked' = filter (\(waitno, _, _) -> unreg_waitno /= waitno) blocked
+                            , not (null blocked')] }
     
 
 markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
