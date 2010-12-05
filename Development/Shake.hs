@@ -56,6 +56,8 @@ import System.Time (ClockTime(..))
 
 import GHC.Conc (numCapabilities)
 
+import Debug.Trace -- FIXME: remove traces
+
 
 -- | Verbosity level: higher is more verbose. Levels are as follows:
 --
@@ -101,6 +103,7 @@ data ShakeState = SS {
 
 data ShakeEnv o = SE {
     se_database :: Database,
+    se_waiting_upon :: MVar WaitingUpon,
     se_pool :: Pool,
     se_oracle :: o,
     se_verbosity :: Verbosity
@@ -109,6 +112,7 @@ data ShakeEnv o = SE {
 instance Functor ShakeEnv where
     fmap f se = SE {
         se_database = se_database se,
+        se_waiting_upon = se_waiting_upon se,
         se_pool = se_pool se,
         se_oracle = f (se_oracle se),
         se_verbosity = se_verbosity se
@@ -259,7 +263,7 @@ data ActState = AS {
 
 data ActEnv o = AE {
     ae_oracle :: o, -- NB: Act *should not* (and cannot, thanks to the type system) access the Oracle from the ShakeEnv, because that is the "dynamically scoped" one
-    ae_blocks_fps :: [FilePath],
+    ae_blocks_fps :: [WaitHandle],
     ae_global_env :: ShakeEnv (),
     ae_global_rules :: [SomeRule]
   }
@@ -326,7 +330,9 @@ shake mx = withPool numCapabilities $ \pool -> do
     when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
-    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
+    waiting_upon <- newMVar []
+    
+    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_waiting_upon = waiting_upon, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -469,7 +475,7 @@ need' e init_fps = do
     let -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
         -- of the rule have not changed
-        history_requires_rerun :: [FilePath] -> Oracle o => o -> QA -> IO (Maybe String)
+        history_requires_rerun :: [WaitHandle] -> Oracle o => o -> QA -> IO (Maybe String)
         history_requires_rerun _ o (Oracle td bs_q bs_a) = 
             case peekOracle td bs_q bs_a of
                 Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
@@ -525,7 +531,7 @@ need' e init_fps = do
                     -- NB: people wanting *any* of the files created by this rule should wait on the same WaitHandle
                     wait_handle <- newWaitHandle
                     db <- return $ foldr (\potential_creates_fp db -> M.insert potential_creates_fp (Building mb_hist wait_handle) db) db potential_creates_fps
-                    blocks_fps <- return $ potential_creates_fps ++ blocks_fps
+                    blocks_fps <- return $ wait_handle : blocks_fps
     
                     (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
                                                                         Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun blocks_fps potential_o) hist
@@ -542,7 +548,7 @@ need' e init_fps = do
                           --
                           -- Note that a rule waiting *does not* block the creation of files built by other rules. This is because everything
                           -- gets executed in parallel.
-                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_blocks_fps = potential_creates_fps ++ ae_blocks_fps e }))
+                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_blocks_fps = wait_handle : ae_blocks_fps e }))
                           Just clean_hist -> ([fp], do
                             nested_time <- get_clean_mod_time fp
                             return (clean_hist, [(fp, nested_time)]))
@@ -580,22 +586,61 @@ need' e init_fps = do
         case mb_wait_handle of
           Nothing -> return ()
           Just wait_handle -> do
-            -- NB: Waiting on the handle leads to a deadlock iff the worker responsible for triggering that wait handle
-            -- eventually waits on one of the init_blocks_fps.
-            --
-            -- TODO: implement a less rubbish cycle detector based on this observation. The current one can fall down in situations
-            -- where we have multiple threads working, because each thread will have only part of the dependency graph.
-            -- One possible scheme:
-            --  1) Add the init_blocks_fps to the WaitHandle somehow just before waiting on it
-            --  2) Check if the wait handle has FilePaths attached that I am responsible for triggering in the future just before waiting on it
-            when (clean_fp `elem` ae_blocks_fps e) $ shakefileError $ "Cyclic dependency detected: the file " ++ clean_fp ++ " depended on itself in a chain involving (some of) " ++ showStringList (ae_blocks_fps e)
-            
-            -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+            -- We can avoid a lot of fuss if the wait handle is already triggered so there can be no waiting...
             may_wait <- mayWaitOnWaitHandle wait_handle
-            when may_wait $ extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
+            when may_wait $ do
+                -- NB: Waiting on the handle leads to a deadlock iff the worker responsible for triggering that wait handle
+                -- eventually waits on one of the init_blocks_fps.
+                --
+                -- TODO: implement a less rubbish cycle detector based on this observation. The current one can fall down in situations
+                -- where we have multiple threads working, because each thread will have only part of the dependency graph.
+                -- One possible scheme:
+                --  1) Add the init_blocks_fps to the WaitHandle somehow just before waiting on it
+                --  2) Check if the wait handle has FilePaths attached that I am responsible for triggering in the future just before waiting on it
+                --FIXME: when (clean_fp `elem` ae_blocks_fps e) $ shakefileError $ "Cyclic dependency detected: the file " ++ clean_fp ++ " depended on itself in a chain involving (some of) " ++ showStringList (ae_blocks_fps e)
+
+                -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+                registerWait (se_waiting_upon (ae_global_env e)) wait_handle (ae_blocks_fps e) $
+                    extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     return $ unclean_times ++ clean_times
+
+-- | A list of 'WaitHandle's that cannot be awoken because the threads that
+-- would do the awaking are blocked on another 'WaitHandle'
+type BlockedWaitHandles = [WaitHandle]
+
+-- | Mapping from 'WaitHandle's being awaited upon to the 'WaitHandle's blocked
+-- from being awoken as a consequence of that waiting.
+type WaitingUpon = [(WaitHandle, BlockedWaitHandles)]
+
+-- FIXME: this really needs a cleanup and explanation!
+-- TODO: I'm not really sure if this is correct
+registerWait :: MVar WaitingUpon -> WaitHandle -> BlockedWaitHandles -> IO a -> IO a
+registerWait mvar_waiting_upon new_wait_handle waiting_will_block_handles act = Exception.bracket register (\() -> unregister) (\() -> act)
+  where
+    unregister = modifyMVar_ mvar_waiting_upon (Exception.evaluate . unregister')
+    unregister' waiting_upon = [ (wait_handle, blocked_wait_handles')
+                               | (wait_handle, blocked_wait_handles) <- waiting_upon
+                               , let blocked_wait_handles' = if wait_handle == new_wait_handle
+                                                             then filter (not . (`elem` waiting_will_block_handles)) blocked_wait_handles
+                                                             else blocked_wait_handles
+                               , not (null blocked_wait_handles') ]
+    
+    register = modifyMVar_ mvar_waiting_upon (Exception.evaluate . register')
+    register' waiting_upon
+      -- | trace (show [(wh == new_wait_handle, map (== new_wait_handle) wbh) | (wh, wbh) <- waiting_upon]) False = undefined
+      | new_wait_handle `elem` transitive waiting_will_block_handles = shakefileError $ "Cyclic dependency detected" -- FIXME: add information about cycle
+      | otherwise                                                    = (new_wait_handle, find_blocked_wait_handles new_wait_handle ++ waiting_will_block_handles) : filter ((/= new_wait_handle) . fst) waiting_upon
+      where
+        find_blocked_wait_handles wait_handle = fromMaybe [] (wait_handle `lookup` waiting_upon)
+        
+        fixEq f x | x == x'   = x
+                  | otherwise = fixEq f x'
+          where x' = f x
+        
+        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ concatMap find_blocked_wait_handles blocked
+    
 
 markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
 markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . go)
