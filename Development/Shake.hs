@@ -48,6 +48,7 @@ import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
 import Data.List
+import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
 
 import System.Directory
 import System.Environment
@@ -106,6 +107,7 @@ data ShakeState = SS {
 data ShakeEnv o = SE {
     se_database :: Database,
     se_wait_database :: MVar WaitDatabase,
+    se_report :: MVar ReportDatabase,
     se_pool :: Pool,
     se_oracle :: o,
     se_verbosity :: Verbosity
@@ -115,6 +117,7 @@ instance Functor ShakeEnv where
     fmap f se = SE {
         se_database = se_database se,
         se_wait_database = se_wait_database se,
+        se_report = se_report se,
         se_pool = se_pool se,
         se_oracle = f (se_oracle se),
         se_verbosity = se_verbosity se
@@ -335,8 +338,9 @@ shake mx = withPool numCapabilities $ \pool -> do
     db_mvar <- newMVar db
     
     wdb_mvar <- newMVar emptyWaitDatabase
+    report_mvar <- emptyReportDatabase >>= newMVar
     
-    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_wait_database = wdb_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
+    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_wait_database = wdb_mvar, se_report = report_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -591,7 +595,7 @@ need' e init_fps = do
     (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps []
     
     -- Run the rules we have decided upon in parallel
-    unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> do
+    unclean_times <- fmap concat $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (se_report (ae_global_env e)) $ do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
@@ -604,9 +608,11 @@ need' e init_fps = do
           Just wait_handle -> do
             -- We can avoid a lot of fuss if the wait handle is already triggered so there can be no waiting...
             may_wait <- mayWaitOnWaitHandle wait_handle
-            when may_wait $ registerWait (se_wait_database (ae_global_env e)) clean_fp wait_handle (ae_would_block_handles e) $
-                    -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
-                    extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
+            when may_wait $ 
+              reportWorkerBlocked (se_report (ae_global_env e)) $ 
+                registerWait (se_wait_database (ae_global_env e)) clean_fp wait_handle (ae_would_block_handles e) $
+                  -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+                  extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     return $ unclean_times ++ clean_times
@@ -683,7 +689,52 @@ registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.
       = wdb { wdb_waiters = [(waiting_on, blocked') | (waiting_on, blocked) <- wdb_waiters wdb
                             , let blocked' = filter (\(waitno, _, _) -> unreg_waitno /= waitno) blocked
                             , not (null blocked')] }
-    
+
+
+data ReportDatabase = RDB {
+    rdb_observed_concurrency :: [(UTCTime, Int)],
+    rdb_concurrency :: Int,
+    rdb_start_at :: UTCTime
+  }
+
+emptyReportDatabase :: IO ReportDatabase
+emptyReportDatabase = do
+    ts <- getCurrentTime
+    return $ RDB {
+        rdb_observed_concurrency = [(ts, 1)],
+        rdb_concurrency = 1,
+        rdb_start_at = ts
+      }
+
+reportWorkerBlocked, reportWorkerRunning :: MVar ReportDatabase -> IO a -> IO a
+reportWorkerBlocked = reportConcurrencyBump (-1)
+reportWorkerRunning = reportConcurrencyBump 1
+
+reportConcurrencyBump :: Int -> MVar ReportDatabase -> IO a -> IO a
+reportConcurrencyBump bump mvar_rdb act = Exception.bracket (bump_concurrency bump) (\() -> bump_concurrency (negate bump)) (\() -> act)
+  where bump_concurrency directed_bump = modifyMVar_ mvar_rdb $ \rdb -> getCurrentTime >>= \ts -> return $ rdb { rdb_concurrency = rdb_concurrency rdb + directed_bump, rdb_observed_concurrency = (ts, rdb_concurrency rdb - directed_bump) : rdb_observed_concurrency rdb }
+
+finaliseReport :: ReportDatabase -> String
+finaliseReport rdb = "<html><head><title>OpenShake report</title></head><body><h1>Parallelism Report</h1><img src=\"" ++ googleChartURL (600, 200) concurrency_xy ++ "\" /></body></html>"
+  where concurrency_xy = [(realToFrac (time `diffUTCTime` rdb_start_at rdb) :: Double, concurrency) | (time, concurrency) <- rdb_observed_concurrency rdb]
+
+-- See <http://code.google.com/apis/chart/docs/data_formats.html>, <http://code.google.com/apis/chart/docs/chart_params.html>
+googleChartURL :: (Ord a, Ord b, Num a, Num b) => (Int, Int) -> [(a, b)] -> String
+googleChartURL (width, height) xys
+  = "http://chart.apis.google.com/chart?cht=lxy&chd=t:" ++ encode xs ++ "|" ++ encode ys ++
+    "&chds=" ++ range xs ++ "," ++ range ys ++              -- Setup data range for the text encoding
+    "&chxt=x,y&chxr=0," ++ range xs ++ "|1," ++ range ys ++ -- Setup axis range
+    "&chco=3674FB" ++                                       -- Color of line
+    "&chm=B,76A4FB,0,0,0" ++                                -- Color underneath the drawn line
+    "&chs=" ++ show width ++ "x" ++ show height             -- Image size
+  where (xs, ys) = unzip xys
+        
+        encode :: Show a => [a] -> String
+        encode = intercalate "," . map show
+        
+        range :: (Ord a, Show a) => [a] -> String
+        range zs = show (minimum zs) ++ "," ++ show (maximum zs)
+
 
 markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
 markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . go)
