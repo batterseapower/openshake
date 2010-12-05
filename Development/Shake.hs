@@ -600,7 +600,7 @@ need' e init_fps = do
                 --FIXME: when (clean_fp `elem` ae_blocks_fps e) $ shakefileError $ "Cyclic dependency detected: the file " ++ clean_fp ++ " depended on itself in a chain involving (some of) " ++ showStringList (ae_blocks_fps e)
 
                 -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
-                registerWait (se_waiting_upon (ae_global_env e)) wait_handle (ae_blocks_fps e) $
+                registerWait (se_waiting_upon (ae_global_env e)) clean_fp wait_handle (ae_blocks_fps e) $
                     extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
@@ -608,7 +608,7 @@ need' e init_fps = do
 
 -- | A list of 'WaitHandle's that cannot be awoken because the threads that
 -- would do the awaking are blocked on another 'WaitHandle'
-type BlockedWaitHandles = [WaitHandle]
+type BlockedWaitHandles = [(FilePath, [WaitHandle])]
 
 -- | Mapping from 'WaitHandle's being awaited upon to the 'WaitHandle's blocked
 -- from being awoken as a consequence of that waiting.
@@ -616,22 +616,28 @@ type WaitingUpon = [(WaitHandle, BlockedWaitHandles)]
 
 -- FIXME: this really needs a cleanup and explanation!
 -- TODO: I'm not really sure if this is correct
-registerWait :: MVar WaitingUpon -> WaitHandle -> BlockedWaitHandles -> IO a -> IO a
-registerWait mvar_waiting_upon new_wait_handle waiting_will_block_handles act = Exception.bracket register (\() -> unregister) (\() -> act)
+registerWait :: MVar WaitingUpon -> FilePath -> WaitHandle -> [WaitHandle] -> IO a -> IO a
+registerWait mvar_waiting_upon new_why new_wait_handle waiting_will_block_handles act = Exception.bracket register (\() -> unregister) (\() -> act)
   where
     unregister = modifyMVar_ mvar_waiting_upon (Exception.evaluate . unregister')
     unregister' waiting_upon = [ (wait_handle, blocked_wait_handles')
                                | (wait_handle, blocked_wait_handles) <- waiting_upon
                                , let blocked_wait_handles' = if wait_handle == new_wait_handle
-                                                             then filter (not . (`elem` waiting_will_block_handles)) blocked_wait_handles
+                                                             then [ (why, handles')
+                                                                  | (why, handles) <- blocked_wait_handles
+                                                                  , let handles' = if why == new_why
+                                                                                   then filter (not . (`elem` waiting_will_block_handles)) handles
+                                                                                   else handles
+                                                                  , not (null handles') ]
                                                              else blocked_wait_handles
                                , not (null blocked_wait_handles') ]
     
     register = modifyMVar_ mvar_waiting_upon (Exception.evaluate . register')
     register' waiting_upon
-      -- | trace (show [(wh == new_wait_handle, map (== new_wait_handle) wbh) | (wh, wbh) <- waiting_upon]) False = undefined
-      | new_wait_handle `elem` transitive waiting_will_block_handles = shakefileError $ "Cyclic dependency detected" -- FIXME: add information about cycle
-      | otherwise                                                    = (new_wait_handle, find_blocked_wait_handles new_wait_handle ++ waiting_will_block_handles) : filter ((/= new_wait_handle) . fst) waiting_upon
+      = case [why_chain | (why_chain, handles) <- transitive [([new_why], waiting_will_block_handles)], new_wait_handle `elem` handles] of
+          -- _ | trace (show [(wh == new_wait_handle, map (== new_wait_handle) wbh) | (wh, wbh) <- waiting_upon]) False -> undefined
+          why_chain:_ -> shakefileError $ "Cyclic dependency detected through the chain " ++ showStringList why_chain
+          []          -> (new_wait_handle, (new_why, waiting_will_block_handles) : find_blocked_wait_handles new_wait_handle) : filter ((/= new_wait_handle) . fst) waiting_upon
       where
         find_blocked_wait_handles wait_handle = fromMaybe [] (wait_handle `lookup` waiting_upon)
         
@@ -639,7 +645,7 @@ registerWait mvar_waiting_upon new_wait_handle waiting_will_block_handles act = 
                   | otherwise = fixEq f x'
           where x' = f x
         
-        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ concatMap find_blocked_wait_handles blocked
+        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [(why : why_chain, new_handles) | (why_chain, handles) <- blocked, handle <- handles, (why, new_handles) <- find_blocked_wait_handles handle]
     
 
 markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
