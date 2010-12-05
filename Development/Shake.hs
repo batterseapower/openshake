@@ -222,7 +222,6 @@ putOracle :: forall o. Oracle o
           -> (String, BS.ByteString, BS.ByteString)
 putOracle q a = (show (typeOf (undefined :: o)), runPut $ put q, runPut $ put a)
 
--- TODO: catch any errors incurred when deserializing the question and answer
 peekOracle :: forall o. Oracle o
            => String -> BS.ByteString -> BS.ByteString
            -> Maybe (Question o, Answer o)
@@ -339,10 +338,11 @@ shake mx = withPool numCapabilities $ \pool -> do
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
 
 
-class (Typeable o,
-       Eq (Question o), Eq (Answer o),
+class (Eq (Question o), Eq (Answer o),
        Binary (Question o), Binary (Answer o),
-       Show (Question o), Show (Answer o)) => Oracle o where -- Show is only required for nice debugging output
+       Show (Question o), Show (Answer o),       -- Show is only required for nice debugging output
+       NFData (Question o), NFData (Answer o),   -- NFData is only required for reasonable errors when deserialization fails
+       Typeable o) => Oracle o where
     data Question o
     data Answer o
     queryOracle :: o -> Question o -> IO (Answer o)
@@ -374,15 +374,21 @@ instance Binary (Answer ()) where
     get = internalError "The empty question was got"
     put = internalError "The empty question was put"
 
+instance NFData (Question ()) where
+    rnf = internalError "The empty question was forced"
+
+instance NFData (Answer ()) where
+    rnf = internalError "The empty answer was forced"
+
 
 newtype StringOracle = SO ((String, String) -> IO [String])
                      deriving (Typeable)
 
 instance Oracle StringOracle where
-    data Question StringOracle = SQ { unSQ :: (String, String) }
-                               deriving (Eq, Show)
-    data Answer StringOracle = SA { unSA :: [String] }
-                             deriving (Eq, Show)
+    newtype Question StringOracle = SQ { unSQ :: (String, String) }
+                                  deriving (Eq, Show, NFData)
+    newtype Answer StringOracle = SA { unSA :: [String] }
+                                deriving (Eq, Show, NFData)
     queryOracle (SO f) = fmap SA . f . unSQ
 
 instance Binary (Question StringOracle) where
@@ -477,6 +483,11 @@ need' e init_fps = do
             case peekOracle td bs_q bs_a of
                 Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
                 Just (question, old_answer) -> do
+                  -- The type of the question or answer (or their serialization schemes) might have changed since the last run,
+                  -- so check that deserialization gives reasonable results
+                  () <- (Exception.evaluate (rnf question `seq` rnf old_answer)) `Exception.catch` \(Exception.ErrorCall reason) -> do
+                      when (verbosity >= NormalVerbosity) $ putStrLn $ "Question/answer unreadable (" ++ reason ++ "), assuming answer changed"
+                  
                   new_answer <- queryOracle o question
                   return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
         history_requires_rerun would_block_handles _ (Need nested_fps_times) = do
