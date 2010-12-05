@@ -89,6 +89,10 @@ internalError :: String -> a
 internalError s = error $ "Internal Shake error: " ++ s
 
 
+runGetAll :: Get a -> BS.ByteString -> a
+runGetAll get bs = case runGetState get bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
+
+
 type CreatesFiles = [FilePath]
 type Rule o = FilePath -> Maybe (CreatesFiles, Act o ())
 
@@ -225,7 +229,7 @@ putOracle q a = (show (typeOf (undefined :: o)), runPut $ put q, runPut $ put a)
 peekOracle :: forall o. Oracle o
            => String -> BS.ByteString -> BS.ByteString
            -> Maybe (Question o, Answer o)
-peekOracle typerep bs_q bs_a = guard (show (typeOf (undefined :: o)) == typerep) >> return (runGet get bs_q, runGet get bs_a)
+peekOracle typerep bs_q bs_a = guard (show (typeOf (undefined :: o)) == typerep) >> return (runGetAll get bs_q, runGetAll get bs_a)
 
 getSizedByteString :: Get BS.ByteString
 getSizedByteString = do
@@ -325,7 +329,7 @@ shake mx = withPool numCapabilities $ \pool -> do
         Just bs -> length (BS.unpack bs) `seq` (Exception.evaluate (rnf db) >> return db) `Exception.catch` \(Exception.ErrorCall reason) -> do
             when (verbosity >= NormalVerbosity) $ putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
             return M.empty
-          where db = runGet getPureDatabase bs
+          where db = runGetAll getPureDatabase bs
     
     when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
@@ -485,11 +489,13 @@ need' e init_fps = do
                 Just (question, old_answer) -> do
                   -- The type of the question or answer (or their serialization schemes) might have changed since the last run,
                   -- so check that deserialization gives reasonable results
-                  () <- (Exception.evaluate (rnf question `seq` rnf old_answer)) `Exception.catch` \(Exception.ErrorCall reason) -> do
-                      when (verbosity >= NormalVerbosity) $ putStrLn $ "Question/answer unreadable (" ++ reason ++ "), assuming answer changed"
-                  
-                  new_answer <- queryOracle o question
-                  return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
+                  mb_deserialize_error <- (Exception.evaluate (rnf question `seq` rnf old_answer) >> return Nothing) `Exception.catch`
+                                          \(Exception.ErrorCall reason) -> return $ Just $ "question/answer unreadable (" ++ reason ++ "), assuming answer changed"
+                  case mb_deserialize_error of
+                    Just deserialize_error -> return $ Just deserialize_error
+                    Nothing -> do
+                      new_answer <- queryOracle o question
+                      return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
         history_requires_rerun would_block_handles _ (Need nested_fps_times) = do
             let (nested_fps, nested_old_times) = unzip nested_fps_times
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
