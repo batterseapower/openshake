@@ -56,8 +56,6 @@ import System.Time (ClockTime(..))
 
 import GHC.Conc (numCapabilities)
 
-import Debug.Trace -- FIXME: remove traces
-
 
 -- | Verbosity level: higher is more verbose. Levels are as follows:
 --
@@ -103,7 +101,7 @@ data ShakeState = SS {
 
 data ShakeEnv o = SE {
     se_database :: Database,
-    se_waiting_upon :: MVar WaitingUpon,
+    se_waiting_upon :: MVar WaitDatabase,
     se_pool :: Pool,
     se_oracle :: o,
     se_verbosity :: Verbosity
@@ -330,7 +328,7 @@ shake mx = withPool numCapabilities $ \pool -> do
     when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
-    waiting_upon <- newMVar []
+    waiting_upon <- newMVar (WDB 0 [])
     
     ((), _final_s) <- runShake (SE { se_database = db_mvar, se_waiting_upon = waiting_upon, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
     
@@ -606,46 +604,50 @@ need' e init_fps = do
     
     return $ unclean_times ++ clean_times
 
--- | A list of 'WaitHandle's that cannot be awoken because the threads that
--- would do the awaking are blocked on another 'WaitHandle'
-type BlockedWaitHandles = [(FilePath, [WaitHandle])]
+type WaitNumber = Int
+
+-- | A 'WaitHandle's that cannot be awoken because the thread that
+-- would do the awaking are blocked on another 'WaitHandle'. With each blocked 'WaitHandle'
+-- we record the reason that we did the blocking in the first place in the form of a 'FilePath'.
+--
+-- We record a 'WaitNumber' with each entry so that we can unregister a wait that we previously
+-- added without interfering with information that has been added in the interim.
+type BlockedWaitHandle = (WaitNumber, FilePath, WaitHandle)
 
 -- | Mapping from 'WaitHandle's being awaited upon to the 'WaitHandle's blocked
 -- from being awoken as a consequence of that waiting.
-type WaitingUpon = [(WaitHandle, BlockedWaitHandles)]
+data WaitDatabase = WDB {
+    wdb_next_waitno :: WaitNumber,
+    wdb_waiters :: [(WaitHandle, [BlockedWaitHandle])]
+  }
 
 -- FIXME: this really needs a cleanup and explanation!
 -- TODO: I'm not really sure if this is correct
-registerWait :: MVar WaitingUpon -> FilePath -> WaitHandle -> [WaitHandle] -> IO a -> IO a
-registerWait mvar_waiting_upon new_why new_wait_handle waiting_will_block_handles act = Exception.bracket register (\() -> unregister) (\() -> act)
+registerWait :: MVar WaitDatabase -> FilePath -> WaitHandle -> [WaitHandle] -> IO a -> IO a
+registerWait mvar_waiting_upon new_why new_wait_handle waiting_will_block_handles act = Exception.bracket register unregister (\_ -> act)
   where
-    unregister = modifyMVar_ mvar_waiting_upon (Exception.evaluate . unregister')
-    unregister' waiting_upon = [ (wait_handle, blocked_wait_handles')
-                               | (wait_handle, blocked_wait_handles) <- waiting_upon
-                               , let blocked_wait_handles' = if wait_handle == new_wait_handle
-                                                             then [ (why, handles')
-                                                                  | (why, handles) <- blocked_wait_handles
-                                                                  , let handles' = if why == new_why
-                                                                                   then filter (not . (`elem` waiting_will_block_handles)) handles
-                                                                                   else handles
-                                                                  , not (null handles') ]
-                                                             else blocked_wait_handles
-                               , not (null blocked_wait_handles') ]
+    unregister unreg_waitno = modifyMVar_ mvar_waiting_upon (Exception.evaluate . unregister' unreg_waitno)
+    unregister' unreg_waitno wdb
+      = wdb { wdb_waiters = [(waiting_on, blocked') | (waiting_on, blocked) <- wdb_waiters wdb, let blocked' = filter (\(waitno, _, _) -> unreg_waitno /= waitno) blocked, not (null blocked')] }
     
-    register = modifyMVar_ mvar_waiting_upon (Exception.evaluate . register')
-    register' waiting_upon
-      = case [why_chain | (why_chain, handles) <- transitive [([new_why], waiting_will_block_handles)], new_wait_handle `elem` handles] of
-          -- _ | trace (show [(wh == new_wait_handle, map (== new_wait_handle) wbh) | (wh, wbh) <- waiting_upon]) False -> undefined
+    register = modifyMVar mvar_waiting_upon (Exception.evaluate . register')
+    register' (WDB next_waitno waiters)
+      = case [why_chain | (why_chain, handle) <- transitive [([new_why], handle) | handle <- waiting_will_block_handles], new_wait_handle == handle] of
           why_chain:_ -> shakefileError $ "Cyclic dependency detected through the chain " ++ showStringList why_chain
-          []          -> (new_wait_handle, (new_why, waiting_will_block_handles) : find_blocked_wait_handles new_wait_handle) : filter ((/= new_wait_handle) . fst) waiting_upon
+          []          -> (wdb', next_waitno)
       where
-        find_blocked_wait_handles wait_handle = fromMaybe [] (wait_handle `lookup` waiting_upon)
+        wdb' = WDB (next_waitno + 1) $ (new_wait_handle, [(next_waitno, new_why, waiting_will_block_handle) | waiting_will_block_handle <- waiting_will_block_handles] ++ find_blocked_wait_handles new_wait_handle) :
+                                       filter ((/= new_wait_handle) . fst) waiters
         
+        find_blocked_wait_handles :: WaitHandle -> [BlockedWaitHandle]
+        find_blocked_wait_handles wait_handle = fromMaybe [] (wait_handle `lookup` waiters)
+        
+        fixEq :: Eq a => (a -> a) -> a -> a
         fixEq f x | x == x'   = x
                   | otherwise = fixEq f x'
           where x' = f x
         
-        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [(why : why_chain, new_handles) | (why_chain, handles) <- blocked, handle <- handles, (why, new_handles) <- find_blocked_wait_handles handle]
+        transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [(why : why_chain, new_handle) | (why_chain, handle) <- blocked, (_waitno, why, new_handle) <- find_blocked_wait_handles handle]
     
 
 markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO ()
