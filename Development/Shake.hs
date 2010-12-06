@@ -367,7 +367,7 @@ putStrLnAt at_verbosity msg = do
 
 -- NB: if you use shake in a nested way bad things will happen to parallelism
 -- TODO: make parallelism configurable?
-shake :: Shake FileName StringOracle () -> IO ()
+shake :: Namespace n => Shake n StringOracle () -> IO ()
 shake mx = withPool numCapabilities $ \pool -> do
     -- TODO: when we have more command line options, use a proper command line argument parser.
     -- We should also work out whether shake should be doing argument parsing at all, given that it's
@@ -388,7 +388,7 @@ shake mx = withPool numCapabilities $ \pool -> do
             return M.empty
           where db = runGetAll getPureDatabase bs
     
-    when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [unFN fp ++ ": " ++ show status | (fp, status) <- M.toList db]
+    when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [show fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
     wdb_mvar <- newMVar emptyWaitDatabase
