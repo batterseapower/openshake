@@ -12,7 +12,7 @@ import Data.List
 import Data.Maybe
 
 
-cIncludes :: FilePath -> Act o [FilePath]
+cIncludes :: FilePath -> Act FileName o [FilePath] -- TODO: more polymorphism
 cIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack
