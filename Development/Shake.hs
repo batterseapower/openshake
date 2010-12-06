@@ -1,6 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
+{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving, RankNTypes #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -101,8 +101,12 @@ runGetAll :: Get a -> BS.ByteString -> a
 runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
 
 
-class (Ord n, Show n, Show (Entry n), Binary n, Binary (Entry n), NFData n, NFData (Entry n)) => Namespace n where
+class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), NFData n, NFData (Entry n)) => Namespace n where
     type Entry n
+    -- | Tests whether the cached value for some Dirty entry still appears to be correct. If it is certainly incorrect,
+    -- returns a human-readable reason as to why it should be discarded.
+    sanityCheck :: n -> Entry n -> IO (Maybe String)
+    sanityCheck _ _ = return Nothing
 
 
 newtype FileName = FN { unFN :: FilePath }
@@ -117,6 +121,16 @@ instance Binary FileName where
 
 instance Namespace FileName where
     type Entry FileName = ModTime
+    -- In standard Shake, we would:
+    --   * Not sanity check anything
+    --   * Recover the ModTime by looking at the file modification time
+    --   * And hence dependent files would be rebuilt but the file would not be, even if the modification time had changed since the last run
+    --
+    -- In OpenShake, we would:
+    --   * Cache the ModTime 
+    --   * Sanity check the current ModTime against the current one
+    --   * Thus we detect changes in this file since the last run, so changed files will be rebuilt even if their dependents haven't changed
+    sanityCheck (FN fp) old_mtime = getFileModTime fp >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
 
 
 type CreatesFiles = [FilePath]
@@ -205,10 +219,10 @@ type Database n = MVar (PureDatabase n)
 type PureDatabase n = Map n (Status n)
 
 getPureDatabase :: Namespace n => Get (PureDatabase n)
-getPureDatabase = fmap M.fromList $ getList (liftM2 (,) get (fmap Dirty getHistory))
+getPureDatabase = fmap M.fromList $ getList (liftM2 (,) get (liftM2 Dirty getHistory get))
 
 putPureDatabase :: Namespace n => PureDatabase n -> Put
-putPureDatabase db = putList (\(k, v) -> put k >> putHistory v) (M.toList $ M.mapMaybe prepareStatus db)
+putPureDatabase db = putList (\(fp, (hist, cached)) -> put fp >> putHistory hist >> put cached) (M.toList $ M.mapMaybe prepareStatus db)
 
 -- NB: we seralize Building as Dirty in case we ever want to serialize the database concurrently
 -- with shake actually running. This might be useful to implement e.g. checkpointing...
@@ -216,24 +230,24 @@ putPureDatabase db = putList (\(k, v) -> put k >> putHistory v) (M.toList $ M.ma
 -- NB: we serialize Clean as Dirty as well. This is because when we reload the database we cannot
 -- assume that anything is clean, as one of the things it depends on may have been changed. We have to
 -- verify all our assumptions again!
-prepareStatus :: Status n -> Maybe (History n)
+prepareStatus :: Status n -> Maybe (History n, Entry n)
 prepareStatus (Building mb_hist _) = mb_hist
-prepareStatus (Dirty hist)         = Just hist
-prepareStatus (Clean hist _ )      = Just hist
+prepareStatus (Dirty hist mtime)   = Just (hist, mtime)
+prepareStatus (Clean hist mtime)   = Just (hist, mtime)
 
 type BuildingWaitHandle n = WaitHandle [(n, Entry n)]
 
 -- NB: use of the Clean constructor is just an optimisation that means we don't have to recursively recheck dependencies
 -- whenever a file is need -- instead we can cut the checking process off if we discover than a file is marked as Clean.
 -- Of course, this might go a bit wrong if the file becomes invalidated *during a Shake run*, but we accept that risk.
-data Status n = Dirty (History n)
+data Status n = Dirty (History n) (Entry n) -- NB: the Dirty entry is only valid if the History has not been invalidated! (Key difference from standard Shake: we cache mtime for Dirty files as well...)
               | Clean (History n) (Entry n)
-              | Building (Maybe (History n)) (BuildingWaitHandle n)
+              | Building (Maybe (History n, Entry n)) (BuildingWaitHandle n)
 
 deriving instance (Namespace n) => Show (Status n)
 
 instance Namespace n => NFData (Status n) where
-    rnf (Dirty a) = rnf a
+    rnf (Dirty a b) = rnf a `seq` rnf b
     rnf (Clean a b) = rnf a `seq` rnf b
     rnf (Building a b) = rnf a `seq` b `seq` ()
 
@@ -515,10 +529,8 @@ addRule rule = do
     generator_act :: Oracle o => o -> (CreatesFiles, Act FileName o ()) -> Generator FileName
     generator_act o (creates_fps, act) = (,) (map FN creates_fps) $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) (FN fp)) (liftIO $ getCleanFileModTime fp)) creates_fps
 
-getCleanFileModTime, getCleanFileModTime_internal :: FilePath -> IO ModTime
+getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
--- FIXME: remove use of this function
-getCleanFileModTime_internal fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
 need :: [FilePath] -> Act FileName o ()
 need fps = do
@@ -530,14 +542,17 @@ withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
 withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -> return (x', y)
 
 need' :: ActEnv FileName o -> [FileName] -> IO [(FileName, ModTime)]
-need' e init_fps = do
+need' = need'' findRule
+
+need'' :: forall n o. Namespace n => RuleFinder n -> ActEnv n o -> [n] -> IO [(n, Entry n)]
+need'' find_rule e init_fps = do
     let verbosity = se_verbosity (ae_global_env e)
         db_mvar = se_database (ae_global_env e)
 
     let -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
         -- of the rule have not changed
-        history_requires_rerun :: [BuildingWaitHandle FileName] -> Oracle o => o -> QA FileName -> IO (Maybe String)
+        history_requires_rerun :: forall o'. Oracle o' => [BuildingWaitHandle n] -> o' -> QA n -> IO (Maybe String)
         history_requires_rerun _ o (Oracle td bs_q bs_a) = 
             case peekOracle td bs_q bs_a of
                 Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
@@ -555,16 +570,16 @@ need' e init_fps = do
             let (nested_fps, nested_old_times) = unzip nested_fps_times
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
             -- so we recursively invoke need in order to check if we have any changes
-            nested_new_times <- need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
+            nested_new_times <- need'' find_rule (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
             let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ show nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
             return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                 \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
     
-        find_all_rules :: [(FileName, Either ModTime (BuildingWaitHandle FileName))] -> [([FileName], [FileName], IO [(FileName, ModTime)])]
-                       -> [FileName] -> [BuildingWaitHandle FileName] -> PureDatabase FileName
-                       -> IO (PureDatabase FileName,
-                              ([(FileName, Either ModTime (BuildingWaitHandle FileName))],
-                               [([FileName], IO [(FileName, ModTime)])]))
+        find_all_rules :: [(n, Either (Entry n) (BuildingWaitHandle n))] -> [([n], [n], IO [(n, Entry n)])]
+                       -> [n] -> [BuildingWaitHandle n] -> PureDatabase n
+                       -> IO (PureDatabase n,
+                              ([(n, Either (Entry n) (BuildingWaitHandle n))],
+                               [([n], IO [(n, Entry n)])]))
         find_all_rules pending_cleans pending_uncleans [] _ db = do
             -- Display a helpful message to the user explaining the rules that we have decided upon:
             let all_creates_fps = [creates_fp | (_, creates_fps, _) <- pending_uncleans, creates_fp <- creates_fps]
@@ -577,7 +592,7 @@ need' e init_fps = do
         find_all_rules pending_cleans pending_uncleans (fp:fps) would_block_handles db = do
             let ei_unclean_clean = case M.lookup fp db of
                   Nothing                     -> Left Nothing
-                  Just (Dirty hist)           -> Left (Just hist)
+                  Just (Dirty hist mtime)     -> Left (Just (hist, mtime))
                   Just (Clean _ mtime)        -> Right (Left mtime)
                   Just (Building _ wait_mvar) -> Right (Right wait_mvar)
             
@@ -586,14 +601,14 @@ need' e init_fps = do
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-                  findRule (ae_global_rules e) (unFN fp) $ \(potential_o, potential_creates_fps, potential_rule) -> do
+                  find_rule (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
                     -- 1) Basic sanity check that the rule creates the file we actually need
                     unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
     
                     -- 2) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
                     --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
                     --    use (read or write) by another builder process.
-                    let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp db of Nothing -> False; Just (Dirty _) -> False; _ -> True) potential_creates_fps
+                    let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp db of Nothing -> False; Just (Dirty _ _) -> False; _ -> True) potential_creates_fps
                     unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList (map show potential_creates_fps) ++ " in the process of building " ++ show fp ++
                                                                    ", but the files " ++ showStringList (map show non_dirty_fps) ++ " have been independently built by someone else"
     
@@ -609,14 +624,24 @@ need' e init_fps = do
                     -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
                     would_block_handles <- return $ wait_handle : would_block_handles
     
-                    (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
-                                                                        Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun would_block_handles potential_o) hist
+                    (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing            -> return (db, Right "file was not in the database")
+                                                                        Just (hist, mtime) -> withoutMVar db_mvar db $ do
+                                                                          mb_dirty_reason <- firstJustM $ map (history_requires_rerun would_block_handles potential_o) hist
+                                                                          case mb_dirty_reason of
+                                                                            Just dirty_reason -> return $ Right dirty_reason
+                                                                            Nothing -> do
+                                                                              -- The file wasn't dirty, but it might be "insane". For files, this occurs when the file
+                                                                              -- has changed since we last looked at it even though its dependent files haven't changed.
+                                                                              -- This usually indicates some sort of bad thing has happened (e.g. editing a generated file) --
+                                                                              -- we just rebuild it directly, though we could make another choice:
+                                                                              mb_insane_reason <- sanityCheck fp mtime
+                                                                              return $ maybe (Left (hist, mtime)) Right mb_insane_reason
                     mb_clean_hist <- case ei_clean_hist_dirty_reason of
-                      Left clean_hist -> return (Just clean_hist)
+                      Left (clean_hist, clean_mtime) -> return (Just (clean_hist, clean_mtime))
                       Right dirty_reason -> do
                         when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
                         return Nothing
-                  
+                    
                     let (creates_fps, basic_rule) = case mb_clean_hist of
                           -- Each rule we execute will block the creation of some files if it waits:
                           --   * It blocks the creation the files it *directly outputs*
@@ -624,10 +649,8 @@ need' e init_fps = do
                           --
                           -- Note that any individual rule waiting *does not* block the creation of files built by other rules
                           -- being run right. This is because everything gets executed in parallel.
-                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = wait_handle : ae_would_block_handles e }))
-                          Just clean_hist -> ([fp], do
-                            nested_time <- getCleanFileModTime_internal (unFN fp)
-                            return (clean_hist, [(fp, nested_time)]))
+                          Nothing                        -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = wait_handle : ae_would_block_handles e }))
+                          Just (clean_hist, clean_mtime) -> ([fp], return (clean_hist, [(fp, clean_mtime)])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
                       
                         -- Augment the rule so that when it is run it sets all of the things it built to Clean again
                         rule = do
@@ -840,10 +863,11 @@ appendHistory :: QA n -> Act n o ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-findRule :: [SomeRule FileName] -> FilePath
-         -> (forall o. Oracle o => (o, [FileName], ActEnv FileName o' -> (IO (History FileName, [(FileName, ModTime)]))) -> IO r)
-         -> IO r
-findRule rules fp k = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
+type RuleFinder n = forall r o'. [SomeRule n] -> n -- FIXME: this n shouldn't be here! Should be FilePath?
+                              -> (forall o. Oracle o => (o, [n], ActEnv n o' -> (IO (History n, [(n, Entry n)]))) -> IO r)
+                              -> IO r
+findRule :: RuleFinder FileName
+findRule rules (FN fp) k = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
   [(creates_fps, GeneratorAct o action)] -> k (o, creates_fps, \e -> do
       (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
       return (as_this_history final_nested_s, creates_times))
