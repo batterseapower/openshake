@@ -1,6 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -32,6 +32,7 @@ import qualified Codec.Binary.UTF8.String as UTF8
 import Data.Typeable
 
 import Control.Applicative (Applicative)
+import Control.Arrow (first)
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -98,17 +99,25 @@ runGetAll :: Get a -> BS.ByteString -> a
 runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
 
 
-class Namespace n where
+class (Ord n, Binary n, Show (Entry n), NFData (Entry n)) => Namespace n where
     type Entry n
 
-instance Namespace FilePath where
-    type Entry FilePath = ModTime
+
+newtype FileName = FN { unFN :: FilePath }
+                 deriving (Eq, Ord, NFData)
+
+instance Binary FileName where
+    get = fmap FN getUTF8String
+    put = putUTF8String . unFN
+
+instance Namespace FileName where
+    type Entry FileName = ModTime
 
 
 type CreatesFiles = [FilePath]
 type Rule o = FilePath -> Maybe (CreatesFiles, Act o ())
 
-type SomeRule = FilePath -> Maybe (Generator FilePath)
+type SomeRule = FilePath -> Maybe (Generator FileName)
 
 type Generator n = ([n], GeneratorAct n)
 data GeneratorAct n = forall o. Oracle o => GeneratorAct o (Act o [(n, Entry n)])
@@ -165,6 +174,10 @@ readerLocal f mx = Reader.ReaderT $ \e -> Reader.runReaderT mx (f e)
 
 type ModTime = ClockTime
 
+-- TODO: remove orphan instance
+instance NFData ClockTime where
+    rnf = rnfModTime
+
 rnfModTime :: ModTime -> ()
 rnfModTime (TOD a b) = rnf a `seq` rnf b
 
@@ -178,14 +191,14 @@ getFileModTime :: FilePath -> IO (Maybe ModTime)
 getFileModTime fp = handleDoesNotExist (return Nothing) (fmap Just (getModificationTime fp))
 
 
-type Database = MVar PureDatabase
-type PureDatabase = Map FilePath Status
+type Database = MVar (PureDatabase FileName)
+type PureDatabase n = Map n (Status n)
 
-getPureDatabase :: Get PureDatabase
-getPureDatabase = fmap M.fromList $ getList (liftM2 (,) getUTF8String (fmap Dirty getHistory))
+getPureDatabase :: (Ord n, Binary n) => Get (PureDatabase n)
+getPureDatabase = fmap M.fromList $ getList (liftM2 (,) get (fmap Dirty getHistory))
 
-putPureDatabase :: PureDatabase -> Put
-putPureDatabase db = putList (\(k, v) -> putUTF8String k >> putHistory v) (M.toList $ M.mapMaybe prepareStatus db)
+putPureDatabase :: (Ord n, Binary n) => PureDatabase n -> Put
+putPureDatabase db = putList (\(k, v) -> put k >> putHistory v) (M.toList $ M.mapMaybe prepareStatus db)
 
 -- NB: we seralize Building as Dirty in case we ever want to serialize the database concurrently
 -- with shake actually running. This might be useful to implement e.g. checkpointing...
@@ -193,7 +206,7 @@ putPureDatabase db = putList (\(k, v) -> putUTF8String k >> putHistory v) (M.toL
 -- NB: we serialize Clean as Dirty as well. This is because when we reload the database we cannot
 -- assume that anything is clean, as one of the things it depends on may have been changed. We have to
 -- verify all our assumptions again!
-prepareStatus :: Status -> Maybe History
+prepareStatus :: Status n -> Maybe History
 prepareStatus (Building mb_hist _) = mb_hist
 prepareStatus (Dirty hist)         = Just hist
 prepareStatus (Clean hist _ )      = Just hist
@@ -201,16 +214,18 @@ prepareStatus (Clean hist _ )      = Just hist
 -- NB: use of the Clean constructor is just an optimisation that means we don't have to recursively recheck dependencies
 -- whenever a file is need -- instead we can cut the checking process off if we discover than a file is marked as Clean.
 -- Of course, this might go a bit wrong if the file becomes invalidated *during a Shake run*, but we accept that risk.
-data Status = Dirty History
-            | Clean History ModTime
-            | Building (Maybe History) WaitHandle
-            deriving (Show)
+data Status n = Dirty History
+              | Clean History (Entry n)
+              | Building (Maybe History) WaitHandle
 
-instance NFData Status where
+deriving instance (Namespace n) => Show (Status n)
+
+instance Namespace n => NFData (Status n) where
     rnf (Dirty a) = rnf a
-    rnf (Clean a b) = rnf a `seq` rnfModTime b
+    rnf (Clean a b) = rnf a `seq` rnf b
     rnf (Building a b) = rnf a `seq` b `seq` ()
 
+-- FIXME: abstract over n
 type History = [QA]
 
 getHistory :: Get History
@@ -347,7 +362,7 @@ shake mx = withPool numCapabilities $ \pool -> do
             return M.empty
           where db = runGetAll getPureDatabase bs
     
-    when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [fp ++ ": " ++ show status | (fp, status) <- M.toList db]
+    when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [unFN fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
     wdb_mvar <- newMVar emptyWaitDatabase
@@ -485,8 +500,8 @@ addRule rule = do
     o <- fmap se_oracle $ askShakeEnv
     modifyShakeState $ \s -> s { ss_rules = (fmap (generator_act o) . rule) : ss_rules s }
   where
-    generator_act :: Oracle o => o -> (CreatesFiles, Act o ()) -> (CreatesFiles, GeneratorAct FilePath)
-    generator_act o (creates_fps, act) = (,) creates_fps $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) fp) (liftIO $ getCleanFileModTime fp)) creates_fps
+    generator_act :: Oracle o => o -> (CreatesFiles, Act o ()) -> Generator FileName
+    generator_act o (creates_fps, act) = (,) (map FN creates_fps) $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) (FN fp)) (liftIO $ getCleanFileModTime fp)) creates_fps
 
 getCleanFileModTime, getCleanFileModTime_internal :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
@@ -533,6 +548,11 @@ need' e init_fps = do
             return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                 \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
     
+        find_all_rules :: [(FilePath, Maybe WaitHandle)] -> [([FilePath], [FilePath], IO [(FilePath, ModTime)])]
+                       -> [FilePath] -> [WaitHandle] -> PureDatabase FileName
+                       -> IO (PureDatabase FileName,
+                              ([(FilePath, Maybe WaitHandle)],
+                               [([FilePath], IO [(FilePath, ModTime)])]))
         find_all_rules pending_cleans pending_uncleans [] _ db = do
             -- Display a helpful message to the user explaining the rules that we have decided upon:
             let all_creates_fps = [creates_fp | (_, creates_fps, _) <- pending_uncleans, creates_fp <- creates_fps]
@@ -543,7 +563,7 @@ need' e init_fps = do
             -- The rule-running code doesn't need to know *all* the files created by a rule run
             return (db, (pending_cleans, [(unclean_fps, rule) | (unclean_fps, _, rule) <- pending_uncleans]))
         find_all_rules pending_cleans pending_uncleans (fp:fps) would_block_handles db = do
-            let ei_unclean_clean = case M.lookup fp db of
+            let ei_unclean_clean = case M.lookup (FN fp) db of
                   Nothing                     -> Left Nothing
                   Just (Dirty hist)           -> Left (Just hist)
                   Just (Clean _ _)            -> Right Nothing
@@ -561,7 +581,7 @@ need' e init_fps = do
                     -- 2) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
                     --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
                     --    use (read or write) by another builder process.
-                    let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp db of Nothing -> False; Just (Dirty _) -> False; _ -> True) potential_creates_fps
+                    let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup (FN non_dirty_fp) db of Nothing -> False; Just (Dirty _) -> False; _ -> True) potential_creates_fps
                     unless (null non_dirty_fps) $ shakefileError $ "A rule promised to yield the files " ++ showStringList potential_creates_fps ++ " in the process of building " ++ fp ++
                                                                    ", but the files " ++ showStringList non_dirty_fps ++ " have been independently built by someone else"
     
@@ -572,7 +592,7 @@ need' e init_fps = do
                     --
                     -- NB: people wanting *any* of the files created by this rule should wait on the same WaitHandle
                     wait_handle <- newWaitHandle
-                    db <- return $ foldr (\potential_creates_fp db -> M.insert potential_creates_fp (Building mb_hist wait_handle) db) db potential_creates_fps
+                    db <- return $ foldr (\potential_creates_fp db -> M.insert (FN potential_creates_fp) (Building mb_hist wait_handle) db) db potential_creates_fps
                     
                     -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
                     would_block_handles <- return $ wait_handle : would_block_handles
@@ -801,7 +821,7 @@ markCleans :: Database -> History -> [FilePath] -> [(FilePath, ModTime)] -> IO (
 markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . go)
   where ([], relevant_nested_times) = lookupMany (\fp -> internalError $ "Rule did not return modification time for the file " ++ fp ++ " that it claimed to create") fps nested_times
     
-        go init_db = foldr (\(fp, nested_time) db -> M.insert fp (Clean nested_hist nested_time) db) init_db relevant_nested_times
+        go init_db = foldr (\(fp, nested_time) db -> M.insert (FN fp) (Clean nested_hist nested_time) db) init_db relevant_nested_times
 
 
 appendHistory :: QA -> Act o ()
@@ -812,9 +832,9 @@ findRule :: [SomeRule] -> FilePath
          -> (forall o. Oracle o => (o, CreatesFiles, ActEnv o' -> (IO (History, [(FilePath, ModTime)]))) -> IO r)
          -> IO r
 findRule rules fp k = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
-  [(creates_fps, GeneratorAct o action)] -> k (o, creates_fps, \e -> do
+  [(creates_fps, GeneratorAct o action)] -> k (o, map unFN creates_fps, \e -> do
       (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
-      return (as_this_history final_nested_s, creates_times))
+      return (as_this_history final_nested_s, map (first unFN) creates_times))
   [] -> do
       -- Not having a rule might still be OK, as long as there is some existing file here:
       mb_nested_time <- getFileModTime fp
