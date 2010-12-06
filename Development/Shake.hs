@@ -1,5 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -31,7 +32,6 @@ import qualified Codec.Binary.UTF8.String as UTF8
 import Data.Typeable
 
 import Control.Applicative (Applicative)
-import Control.Arrow (second)
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -98,11 +98,20 @@ runGetAll :: Get a -> BS.ByteString -> a
 runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
 
 
+class Namespace n where
+    type Entry n
+
+instance Namespace FilePath where
+    type Entry FilePath = ModTime
+
+
 type CreatesFiles = [FilePath]
 type Rule o = FilePath -> Maybe (CreatesFiles, Act o ())
 
-type SomeRule = FilePath -> Maybe (CreatesFiles, SomeRuleAct)
-data SomeRuleAct = forall o. Oracle o => SomeRuleAct o (Act o ())
+type SomeRule = FilePath -> Maybe (Generator FilePath)
+
+type Generator n = ([n], GeneratorAct n)
+data GeneratorAct n = forall o. Oracle o => GeneratorAct o (Act o [(n, Entry n)])
 
 data ShakeState = SS {
     ss_rules :: [SomeRule]
@@ -474,7 +483,15 @@ addRule rule = do
     -- Note the contrast with using the oracle from the point at which need was called to
     -- invoke the rule, which is more akin to a dynamic scoping scheme.
     o <- fmap se_oracle $ askShakeEnv
-    modifyShakeState $ \s -> s { ss_rules = (fmap (second (SomeRuleAct o)) . rule) : ss_rules s }
+    modifyShakeState $ \s -> s { ss_rules = (fmap (generator_act o) . rule) : ss_rules s }
+  where
+    generator_act :: Oracle o => o -> (CreatesFiles, Act o ()) -> (CreatesFiles, GeneratorAct FilePath)
+    generator_act o (creates_fps, act) = (,) creates_fps $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) fp) (liftIO $ getCleanFileModTime fp)) creates_fps
+
+getCleanFileModTime, getCleanFileModTime_internal :: FilePath -> IO ModTime
+getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
+-- FIXME: remove use of this function
+getCleanFileModTime_internal fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
 need :: [FilePath] -> Act o ()
 need fps = do
@@ -489,7 +506,6 @@ need' :: ActEnv o -> [FilePath] -> IO [(FilePath, ModTime)]
 need' e init_fps = do
     let verbosity = se_verbosity (ae_global_env e)
         db_mvar = se_database (ae_global_env e)
-        get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
     let -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
@@ -578,7 +594,7 @@ need' e init_fps = do
                           -- being run right. This is because everything gets executed in parallel.
                           Nothing         -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = wait_handle : ae_would_block_handles e }))
                           Just clean_hist -> ([fp], do
-                            nested_time <- get_clean_mod_time fp
+                            nested_time <- getCleanFileModTime_internal fp
                             return (clean_hist, [(fp, nested_time)]))
                       
                         -- Augment the rule so that when it is run it sets all of the things it built to Clean again
@@ -625,7 +641,7 @@ need' e init_fps = do
                 registerWait (se_wait_database (ae_global_env e)) clean_fp wait_handle (ae_would_block_handles e) $
                   -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
                   extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
-        fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
+        fmap ((,) clean_fp) (getCleanFileModTime_internal clean_fp)
     
     return $ unclean_times ++ clean_times
 
@@ -796,12 +812,8 @@ findRule :: [SomeRule] -> FilePath
          -> (forall o. Oracle o => (o, CreatesFiles, ActEnv o' -> (IO (History, [(FilePath, ModTime)]))) -> IO r)
          -> IO r
 findRule rules fp k = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
-  [(creates_fps, SomeRuleAct o action)] -> k (o, creates_fps, \e -> do
-      ((), final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
-      
-      creates_times <- forM creates_fps $ \creates_fp -> do
-          nested_time <- fmap (fromMaybe $ shakefileError $ "The matching rule did not create " ++ creates_fp) $ liftIO $ getFileModTime creates_fp
-          return (creates_fp, nested_time)
+  [(creates_fps, GeneratorAct o action)] -> k (o, creates_fps, \e -> do
+      (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
       return (as_this_history final_nested_s, creates_times))
   [] -> do
       -- Not having a rule might still be OK, as long as there is some existing file here:
