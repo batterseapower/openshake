@@ -1,6 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving, RankNTypes #-}
+{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -103,10 +103,23 @@ runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' 
 
 class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), NFData n, NFData (Entry n)) => Namespace n where
     type Entry n
+    
     -- | Tests whether the cached value for some Dirty entry still appears to be correct. If it is certainly incorrect,
     -- returns a human-readable reason as to why it should be discarded.
+    --
+    -- The default implementation of this function does no sanity checking.
     sanityCheck :: n -> Entry n -> IO (Maybe String)
     sanityCheck _ _ = return Nothing
+    
+    -- | The rule which we fall back on if there are no other options.
+    --
+    -- In order to get the same behaviour as Shake, we allow the default rule to depend on some IO computation (in particular,
+    -- we need to know whether a file already exists in order to decide if can use the default rule for it).
+    -- TODO: I could just do the IO in the Act monad and delay the error a little bit.
+    --
+    -- The default implementation is not to have a default rule.
+    defaultRule :: n -> IO (Maybe (Generator n))
+    defaultRule _ = return Nothing
 
 
 newtype FileName = FN { unFN :: FilePath }
@@ -127,16 +140,26 @@ instance Namespace FileName where
     --   * And hence dependent files would be rebuilt but the file would not be, even if the modification time had changed since the last run
     --
     -- In OpenShake, we would:
-    --   * Cache the ModTime 
+    --   * Cache the ModTime
     --   * Sanity check the current ModTime against the current one
     --   * Thus we detect changes in this file since the last run, so changed files will be rebuilt even if their dependents haven't changed
     sanityCheck (FN fp) old_mtime = getFileModTime fp >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
+    
+    defaultRule (FN fp) = do
+        -- Not having a rule might still be OK, as long as there is some existing file here:
+        mb_nested_time <- getFileModTime fp
+        case mb_nested_time of
+            Nothing          -> return Nothing
+            -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
+            -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
+            -- check will catch the change.
+            Just nested_time -> return $ Just ([FN fp], GeneratorAct () $ return [(FN fp, nested_time)]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
 
 
 type CreatesFiles = [FilePath]
 type Rule n o = FilePath -> Maybe (CreatesFiles, Act n o ())
 
-type SomeRule n = FilePath -> Maybe (Generator n)
+type SomeRule n = n -> Maybe (Generator n)
 
 type Generator n = ([n], GeneratorAct n)
 data GeneratorAct n = forall o. Oracle o => GeneratorAct o (Act n o [(n, Entry n)])
@@ -487,10 +510,13 @@ ls fp = queryStringOracle ("ls", fp)
 
 -- TODO: Neil's example from his presentation only works if want doesn't actually build anything until the end (he wants before setting up any rules)
 want :: [FilePath] -> Shake FileName o ()
-want fps = do
+want = want' . map FN
+
+want' :: Namespace n => [n] -> Shake n o ()
+want' fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need' fps)
     return ()
 
 (*>) :: Oracle o => String -> (FilePath -> Act FileName o ()) -> Shake FileName o ()
@@ -515,7 +541,13 @@ want fps = do
 
 
 addRule :: Oracle o => Rule FileName o -> Shake FileName o ()
-addRule rule = do
+addRule rule = addRule' (\o -> fmap (generator_act o) . rule . unFN)
+  where
+    generator_act :: Oracle o => o -> (CreatesFiles, Act FileName o ()) -> Generator FileName
+    generator_act o (creates_fps, act) = (,) (map FN creates_fps) $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) (FN fp)) (liftIO $ getCleanFileModTime fp)) creates_fps
+
+addRule' :: Oracle o => (o -> SomeRule n) -> Shake n o ()
+addRule' rule = do
     -- NB: we store the oracle with the rule to implement "lexical scoping" for oracles.
     -- Basically, the oracle in effect when we run some rules action should be the oracle
     -- lexically above at the time the rule was created. Thus, we form the "lexical closure"
@@ -524,28 +556,25 @@ addRule rule = do
     -- Note the contrast with using the oracle from the point at which need was called to
     -- invoke the rule, which is more akin to a dynamic scoping scheme.
     o <- fmap se_oracle $ askShakeEnv
-    modifyShakeState $ \s -> s { ss_rules = (fmap (generator_act o) . rule) : ss_rules s }
-  where
-    generator_act :: Oracle o => o -> (CreatesFiles, Act FileName o ()) -> Generator FileName
-    generator_act o (creates_fps, act) = (,) (map FN creates_fps) $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) (FN fp)) (liftIO $ getCleanFileModTime fp)) creates_fps
+    modifyShakeState $ \s -> s { ss_rules = rule o : ss_rules s }
 
 getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
 need :: [FilePath] -> Act FileName o ()
-need fps = do
+need = need' . map FN
+
+need' :: Namespace n => [n] -> Act n o ()
+need' fps = do
     e <- askActEnv
-    need_times <- liftIO $ need' e (map FN fps)
+    need_times <- liftIO $ need'' e fps
     appendHistory $ Need $ need_times
 
 withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
 withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -> return (x', y)
 
-need' :: ActEnv FileName o -> [FileName] -> IO [(FileName, ModTime)]
-need' = need'' findRule
-
-need'' :: forall n o. Namespace n => RuleFinder n -> ActEnv n o -> [n] -> IO [(n, Entry n)]
-need'' find_rule e init_fps = do
+need'' :: forall n o. Namespace n => ActEnv n o -> [n] -> IO [(n, Entry n)]
+need'' e init_fps = do
     let verbosity = se_verbosity (ae_global_env e)
         db_mvar = se_database (ae_global_env e)
 
@@ -570,7 +599,7 @@ need'' find_rule e init_fps = do
             let (nested_fps, nested_old_times) = unzip nested_fps_times
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
             -- so we recursively invoke need in order to check if we have any changes
-            nested_new_times <- need'' find_rule (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
+            nested_new_times <- need'' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
             let ([], relevant_nested_new_times) = lookupMany (\nested_fp -> internalError $ "The file " ++ show nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
             return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                 \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
@@ -601,7 +630,7 @@ need'' find_rule e init_fps = do
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-                  find_rule (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
+                  findRule (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
                     -- 1) Basic sanity check that the rule creates the file we actually need
                     unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
     
@@ -866,21 +895,20 @@ appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_hi
 type RuleFinder n = forall r o'. [SomeRule n] -> n -- FIXME: this n shouldn't be here! Should be FilePath?
                               -> (forall o. Oracle o => (o, [n], ActEnv n o' -> (IO (History n, [(n, Entry n)]))) -> IO r)
                               -> IO r
-findRule :: RuleFinder FileName
-findRule rules (FN fp) k = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
-  [(creates_fps, GeneratorAct o action)] -> k (o, creates_fps, \e -> do
+findRule :: Namespace n => RuleFinder n
+findRule rules fp k = do
+  (creates_fps, GeneratorAct o action) <- case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
+    [generator] -> return generator
+    [] -> do
+      mb_generator <- defaultRule fp
+      case mb_generator of
+        Nothing        -> shakefileError $ "No rule to build " ++ show fp
+        Just generator -> return generator
+    _generators -> shakefileError $ "Ambiguous rules for " ++ show fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
+  
+  k (o, creates_fps, \e -> do
       (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
       return (as_this_history final_nested_s, creates_times))
-  [] -> do
-      -- Not having a rule might still be OK, as long as there is some existing file here:
-      mb_nested_time <- getFileModTime fp
-      case mb_nested_time of
-          Nothing          -> shakefileError $ "No rule to build " ++ fp
-          -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
-          -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
-          -- check will catch the change.
-          Just nested_time -> k ((), [FN fp], \_ -> return ([], [(FN fp, nested_time)])) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-  _actions -> shakefileError $ "Ambiguous rules for " ++ fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 oracle :: o' -> Shake n o' a -> Shake n o a
 oracle o' = modifyOracle (const o')
