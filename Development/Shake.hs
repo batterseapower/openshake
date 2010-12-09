@@ -892,7 +892,7 @@ appendHistory :: QA n -> Act n o ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-type RuleFinder n = forall r o'. [SomeRule n] -> n -- FIXME: this n shouldn't be here! Should be FilePath?
+type RuleFinder n = forall r o'. [SomeRule n] -> n
                               -> (forall o. Oracle o => (o, [n], ActEnv n o' -> (IO (History n, [(n, Entry n)]))) -> IO r)
                               -> IO r
 findRule :: Namespace n => RuleFinder n
