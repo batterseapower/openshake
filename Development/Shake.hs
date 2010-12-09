@@ -1,6 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
+{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving, TypeOperators, MultiParamTypeClasses #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -35,6 +35,7 @@ import qualified Codec.Binary.UTF8.String as UTF8
 import Data.Typeable
 
 import Control.Applicative (Applicative)
+import Control.Arrow ((***))
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -63,6 +64,8 @@ import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
 import GHC.Conc (numCapabilities)
+
+import Unsafe.Coerce
 
 
 -- | Verbosity level: higher is more verbose. Levels are as follows:
@@ -156,13 +159,110 @@ instance Namespace FileName where
             Just nested_time -> return $ Just ([FN fp], GeneratorAct () $ return [(FN fp, nested_time)]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
 
 
+data OracleN o n = LiftedN n | OracleN BS.ByteString
+
+instance (Oracle o, Namespace n) => Show (OracleN o n) where
+    show (LiftedN n) = show n
+    show (OracleN q) = show (runGetAll get q :: Answer o)
+
+instance (Oracle o, Namespace n) => Eq (OracleN o n) where
+    n1 == n2 = n1 `compare` n2 == EQ
+
+instance (Oracle o, Namespace n) => Ord (OracleN o n) where
+    LiftedN n1 `compare` LiftedN n2 = n1 `compare` n2
+    OracleN q1 `compare` OracleN q2 = runGetAll get q1 `compare` (runGetAll get q2 :: Question o)
+    LiftedN _  `compare` OracleN _ = LT
+    OracleN _ `compare` LiftedN _ = GT
+
+instance (Oracle o, Namespace n) => NFData (OracleN o n) where
+    rnf (LiftedN n) = rnf n
+    rnf (OracleN q) = rnf (BS.unpack q)
+
+instance Namespace n => Binary (OracleN o n) where
+    get = do
+        tag <- getWord8
+        case tag of
+          0 -> fmap LiftedN get
+          1 -> fmap OracleN getSizedByteString
+          _ -> internalError $ "get{OracleN}: unknown tag " ++ show tag
+    put (LiftedN n) = putWord8 0 >> put n
+    put (OracleN q) = putWord8 1 >> putSizedByteString q
+
+
+data OracleE o n = LiftedE (Entry n) | OracleE BS.ByteString
+
+instance (Oracle o, Namespace n) => Show (OracleE o n) where
+    show (LiftedE n) = show n
+    show (OracleE a) = show (runGetAll get a :: Answer o)
+
+instance (Oracle o, Namespace n) => Eq (OracleE o n) where
+    LiftedE n1 == LiftedE n2 = n1 == n2
+    OracleE a1 == OracleE a2 = runGetAll get a1 == (runGetAll get a2 :: Answer o)
+    _ == _ = False
+
+instance (Oracle o, Namespace n) => NFData (OracleE o n) where
+    rnf (LiftedE e) = rnf e
+    rnf (OracleE a) = rnf (BS.unpack a)
+
+instance Namespace n => Binary (OracleE o n) where
+    get = do
+        tag <- getWord8
+        case tag of
+          0 -> fmap LiftedE get
+          1 -> fmap OracleE getSizedByteString
+          _ -> internalError $ "get{OracleE}: unknown tag " ++ show tag
+    put (LiftedE n) = putWord8 0 >> put n
+    put (OracleE a) = putWord8 1 >> putSizedByteString a
+
+
+instance (Oracle o, Namespace n) => Namespace (OracleN o n) where
+    type Entry (OracleN o n) = OracleE o n
+    
+    sanityCheck (LiftedN n) (LiftedE e) = sanityCheck n e
+    sanityCheck (OracleN q) (OracleE a) = return Nothing -- No way to sanity check oracle answer without running it (TODO: what about deserialization?)
+    sanityCheck _           _           = internalError $ "Entry oracleness/liftedness was incoherent"
+    
+    defaultRule (LiftedN n) = fmap (fmap (promoteGenerator (ST LiftedN (\n -> do { LiftedN n' <- return n; return n' })) (ST LiftedE (\e -> do { LiftedE e' <- return e; return e' })))) $ defaultRule n
+    defaultRule (OracleN _) = return Nothing
+
+-- FIXME
+-- class (:<) a b where
+--     superN :: b -> a
+--     superE :: Entry a -> Entry b
+-- 
+-- instance (:<) FileName FileName where
+--     superN = id
+--     superE = id
+-- 
+-- instance (:<) (OracleN o n) (OracleN o n) where
+--     superN = id
+--     superE = id
+-- 
+-- instance ((:<) n n') => (:<) (OracleN o n) n' where
+--     superN = superN . LiftedN
+--     superE e = case e of LiftedE e -> superE e
+
+
 type CreatesFiles = [FilePath]
 type Rule n o = FilePath -> Maybe (CreatesFiles, Act n o ())
 
 type SomeRule n = n -> Maybe (Generator n)
 
+
+data a :< b = ST { sup :: a -> b, sub :: b -> Maybe a }
+
+
+promoteSomeRule :: forall n n'. (n :< n') -> (Entry n :< Entry n') -> SomeRule n -> SomeRule n'
+promoteSomeRule f g rule fp' = sub f fp' >>= \fp -> fmap (promoteGenerator f g) (rule fp)
+
+demoteSomeRule :: forall n n'. (n :< n') -> (Entry n :< Entry n') -> SomeRule n' -> SomeRule n
+demoteSomeRule f g rule fp' = undefined -- FIXME: fmap (demoteGenerator f g) (rule (sup f fp))
+
 type Generator n = ([n], GeneratorAct n)
 data GeneratorAct n = forall o. Oracle o => GeneratorAct o (Act n o [(n, Entry n)])
+
+promoteGenerator :: (n :< n') -> (Entry n :< Entry n') -> Generator n -> Generator n'
+promoteGenerator f g (fps, genact) = (map (sup f) fps, case genact of GeneratorAct o act -> GeneratorAct o (promoteAct f g $ fmap (map (\(n, e) -> (sup f n, sup g e))) act))
 
 data ShakeState n = SS {
     ss_rules :: [SomeRule n]
@@ -175,6 +275,26 @@ data ShakeEnv n o = SE {
     se_pool :: Pool,
     se_oracle :: o,
     se_verbosity :: Verbosity
+  }
+
+promoteShakeEnv :: (n :< n') -> ShakeEnv n o -> ShakeEnv n' o
+promoteShakeEnv f e = SE {
+    se_database = undefined, -- FIXME
+    se_wait_database = unsafeCoerce (se_wait_database e), -- TODO: neaten up
+    se_report = se_report e,
+    se_pool = se_pool e,
+    se_oracle = se_oracle e,
+    se_verbosity = se_verbosity e
+  }
+
+demoteShakeEnv :: (n :< n') -> ShakeEnv n' o -> ShakeEnv n o
+demoteShakeEnv f e = SE {
+    se_database = undefined, -- FIXME
+    se_wait_database = unsafeCoerce (se_wait_database e), -- TODO: neaten up
+    se_report = se_report e,
+    se_pool = se_pool e,
+    se_oracle = se_oracle e,
+    se_verbosity = se_verbosity e
   }
 
 instance Functor (ShakeEnv n) where
@@ -276,6 +396,9 @@ instance Namespace n => NFData (Status n) where
 
 type History n = [QA n]
 
+promoteHistory :: (n :< n') -> (Entry n :< Entry n') -> History n -> History n'
+promoteHistory f g = map (promoteQA f g)
+
 getHistory :: Namespace n => Get (History n)
 getHistory = getList get
 
@@ -284,6 +407,10 @@ putHistory = putList put
 
 data QA n = Oracle String BS.ByteString BS.ByteString
           | Need [(n, Entry n)]
+
+promoteQA :: (n :< n') -> (Entry n :< Entry n') -> QA n -> QA n'
+promoteQA _ _ (Oracle td bs_q bs_a) = Oracle td bs_q bs_a
+promoteQA f g (Need nes) = Need (map (sup f *** sup g) nes)
 
 deriving instance Namespace n => Show (QA n)
 
@@ -342,6 +469,9 @@ data ActState n = AS {
     as_this_history :: History n
   }
 
+promoteActState :: (n :< n') -> (Entry n :< Entry n') -> ActState n -> ActState n'
+promoteActState f g s = AS { as_this_history = promoteHistory f g (as_this_history s) }
+
 data ActEnv n o = AE {
     ae_oracle :: o, -- ^ The oracle for the 'Act' to use when querying. Note that we should not (and cannot, thanks to
                     --   the type system) access the oracle from the 'ShakeEnv', because that is the "dynamically scoped" one
@@ -350,6 +480,22 @@ data ActEnv n o = AE {
                                                       --   block indefinitely here and now. This is used in the deadlock detector.
     ae_global_env :: ShakeEnv n (),
     ae_global_rules :: [SomeRule n]
+  }
+
+promoteActEnv :: (n :< n') -> (Entry n :< Entry n') -> ActEnv n o -> ActEnv n' o
+promoteActEnv f g e = AE {
+    ae_oracle = ae_oracle e,
+    ae_would_block_handles = unsafeCoerce (ae_would_block_handles e), -- TODO: neaten up
+    ae_global_env = promoteShakeEnv f (ae_global_env e),
+    ae_global_rules = map (promoteSomeRule f g) (ae_global_rules e)
+  }
+
+demoteActEnv :: (n :< n') -> (Entry n :< Entry n') -> ActEnv n' o -> ActEnv n o
+demoteActEnv f g e = AE {
+    ae_oracle = ae_oracle e,
+    ae_would_block_handles = unsafeCoerce (ae_would_block_handles e), -- TODO: neaten up
+    ae_global_env = demoteShakeEnv f (ae_global_env e),
+    ae_global_rules = map (demoteSomeRule f g) (ae_global_rules e)
   }
 
 instance Functor (ActEnv n) where
@@ -363,6 +509,9 @@ instance Functor (ActEnv n) where
 
 newtype Act n o a = Act { unAct :: Reader.ReaderT (ActEnv n o) (State.StateT (ActState n) IO) a }
               deriving (Functor, Applicative, Monad, MonadIO)
+
+promoteAct :: (n :< n') -> (Entry n :< Entry n') -> Act n o a -> Act n' o a
+promoteAct f g mx = Act $ Reader.ReaderT $ \e -> State.StateT $ \s -> runAct (demoteActEnv f g e) (AS { as_this_history = [] }) mx >>= \(x, s') -> return (x, s { as_this_history = as_this_history s ++ promoteHistory f g (as_this_history s') })
 
 runAct :: ActEnv n o -> ActState n -> Act n o a -> IO (a, ActState n)
 runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
@@ -427,7 +576,7 @@ shake mx = withPool numCapabilities $ \pool -> do
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
 
 
-class (Eq (Question o), Eq (Answer o),
+class (Ord (Question o), Eq (Answer o),          -- We only need Ord on questions because we stick them into a map
        Binary (Question o), Binary (Answer o),
        Show (Question o), Show (Answer o),       -- Show is only required for nice debugging output
        NFData (Question o), NFData (Answer o),   -- NFData is only required for reasonable errors when deserialization fails
@@ -445,6 +594,9 @@ instance Oracle () where
 
 instance Eq (Question ()) where
     (==) = internalError "The empty question was compared"
+
+instance Ord (Question ()) where
+    compare = internalError "The empty question was compared"
 
 instance Eq (Answer ()) where
     (==) = internalError "The empty answer was compared"
@@ -475,7 +627,7 @@ newtype StringOracle = SO ((String, String) -> IO [String])
 
 instance Oracle StringOracle where
     newtype Question StringOracle = SQ { unSQ :: (String, String) }
-                                  deriving (Eq, Show, NFData)
+                                  deriving (Eq, Ord, Show, NFData)
     newtype Answer StringOracle = SA { unSA :: [String] }
                                 deriving (Eq, Show, NFData)
     queryOracle (SO f) = fmap SA . f . unSQ
@@ -738,7 +890,7 @@ type WaitNumber = Int
 --
 -- We record a 'WaitNumber' with each entry so that we can unregister a wait that we previously
 -- added without interfering with information that has been added in the interim.
-type BlockedWaitHandle n = (WaitNumber, n, BuildingWaitHandle n)
+type BlockedWaitHandle n = (WaitNumber, String, BuildingWaitHandle n)
 
 -- | Mapping from 'WaitHandle's being awaited upon to the 'WaitHandle's blocked
 -- from being awoken as a consequence of that waiting.
@@ -766,18 +918,18 @@ emptyWaitDatabase = WDB {
 --
 -- In this situation we throw an error instead of actually performing the wait, including in the error a descripton
 -- of the dependency chain that lead to the error reconstructed from the individual wait "why" information.
-registerWait :: forall n a. (Show n, Eq n) => MVar (WaitDatabase n) -> n -> BuildingWaitHandle n -> [BuildingWaitHandle n] -> IO a -> IO a
+registerWait :: forall n a. (Show n) => MVar (WaitDatabase n) -> n -> BuildingWaitHandle n -> [BuildingWaitHandle n] -> IO a -> IO a
 registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.bracket register unregister (\_ -> act)
   where
     register = modifyMVar mvar_wdb (Exception.evaluate . register')
     register' (WDB new_waitno waiters)
-      = case [why_chain | (why_chain, handle) <- transitive [([new_why], new_will_block_handle) | new_will_block_handle <- new_will_block_handles], new_handle == handle] of
-          why_chain:_ -> shakefileError $ "Cyclic dependency detected through the chain " ++ showStringList (map show why_chain)
+      = case [why_chain | (why_chain, handle) <- transitive [([show new_why], new_will_block_handle) | new_will_block_handle <- new_will_block_handles], new_handle == handle] of
+          why_chain:_ -> shakefileError $ "Cyclic dependency detected through the chain " ++ showStringList why_chain
           []          -> (wdb', new_waitno)
       where
         -- Update the database with the new waiters on this WaitHandle. We are careful to ensure that any
         -- existing waiters on the handle are preserved and put into the same entry in the association list.
-        wdb' = WDB (new_waitno + 1) $ (new_handle, [ (new_waitno, new_why, new_will_block_handle)
+        wdb' = WDB (new_waitno + 1) $ (new_handle, [ (new_waitno, show new_why, new_will_block_handle)
                                                    | new_will_block_handle <- new_will_block_handles ] ++
                                                    find_blocked_wait_handles new_handle) :
                                       filter ((/= new_handle) . fst) waiters
@@ -787,7 +939,7 @@ registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.
         
         -- When we compute whether we are blocked, we need to do a transitive closure. This is necessary for situations where
         -- e.g. A.o -> B.o -> C.o, because we need to see that A.o is waiting on C.o's WaitHandle through B.o's WaitHandle.
-        transitive :: [([n], BuildingWaitHandle n)] -> [([n], BuildingWaitHandle n)]
+        transitive :: [([String], BuildingWaitHandle n)] -> [([String], BuildingWaitHandle n)]
         transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [ (why : why_chain, next_blocked_handle)
                                                                                          | (why_chain, blocked_handle) <- blocked
                                                                                          , (_waitno, why, next_blocked_handle) <- find_blocked_wait_handles blocked_handle ]
@@ -892,7 +1044,7 @@ appendHistory :: QA n -> Act n o ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-type RuleFinder n = forall r o'. [SomeRule n] -> n -- FIXME: this n shouldn't be here! Should be FilePath?
+type RuleFinder n = forall r o'. [SomeRule n] -> n
                               -> (forall o. Oracle o => (o, [n], ActEnv n o' -> (IO (History n, [(n, Entry n)]))) -> IO r)
                               -> IO r
 findRule :: Namespace n => RuleFinder n
