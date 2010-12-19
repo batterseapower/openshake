@@ -105,34 +105,24 @@ type SomeRule = FilePath -> Maybe (CreatesFiles, SomeRuleAct)
 data SomeRuleAct = forall o. Oracle o => SomeRuleAct o (Act o ())
 
 data ShakeState = SS {
-    ss_rules :: [SomeRule]
+    ss_rules :: [SomeRule],
+    ss_wants :: [FilePath]
   }
 
 data ShakeEnv o = SE {
-    se_database :: Database,
-    se_wait_database :: MVar WaitDatabase,
-    se_report :: MVar ReportDatabase,
-    se_pool :: Pool,
-    se_oracle :: o,
-    se_verbosity :: Verbosity
+    se_oracle :: o
   }
 
 instance Functor ShakeEnv where
     fmap f se = SE {
-        se_database = se_database se,
-        se_wait_database = se_wait_database se,
-        se_report = se_report se,
-        se_pool = se_pool se,
-        se_oracle = f (se_oracle se),
-        se_verbosity = se_verbosity se
+        se_oracle = f (se_oracle se)
       }
 
--- TODO: should Shake really be an IO monad?
-newtype Shake o a = Shake { unShake :: Reader.ReaderT (ShakeEnv o) (State.StateT ShakeState IO) a }
-                  deriving (Functor, Applicative, Monad, MonadIO)
+newtype Shake o a = Shake { unShake :: Reader.ReaderT (ShakeEnv o) (State.State ShakeState) a }
+                  deriving (Functor, Applicative, Monad)
 
-runShake :: ShakeEnv o -> ShakeState -> Shake o a -> IO (a, ShakeState)
-runShake e s mx = State.runStateT (Reader.runReaderT (unShake mx) e) s
+runShake :: ShakeEnv o -> ShakeState -> Shake o a -> (a, ShakeState)
+runShake e s mx = State.runState (Reader.runReaderT (unShake mx) e) s
 
 getShakeState :: Shake o ShakeState
 getShakeState = Shake (lift State.get)
@@ -270,21 +260,27 @@ data ActState = AS {
   }
 
 data ActEnv o = AE {
-    ae_oracle :: o, -- ^ The oracle for the 'Act' to use when querying. Note that we should not (and cannot, thanks to
-                    --   the type system) access the oracle from the 'ShakeEnv', because that is the "dynamically scoped" one
-                    --   that just happens to be in scope at the time we "need" a file, not the one in scope when the rule was created.
+    ae_oracle :: o,                         -- ^ The oracle for the 'Act' to use when querying
     ae_would_block_handles :: [WaitHandle], -- ^ A list of handles that would be incapable of awakening if the action were to
                                             --   block indefinitely here and now. This is used in the deadlock detector.
-    ae_global_env :: ShakeEnv (),
-    ae_global_rules :: [SomeRule]
+    ae_global_rules :: [SomeRule],
+    ae_database :: Database,
+    ae_wait_database :: MVar WaitDatabase,
+    ae_report :: MVar ReportDatabase,
+    ae_pool :: Pool,
+    ae_verbosity :: Verbosity
   }
 
 instance Functor ActEnv where
     fmap f ae = AE {
         ae_oracle = f (ae_oracle ae),
         ae_would_block_handles = ae_would_block_handles ae,
-        ae_global_env = ae_global_env ae,
-        ae_global_rules = ae_global_rules ae
+        ae_global_rules = ae_global_rules ae,
+        ae_database = ae_database ae,
+        ae_wait_database = ae_wait_database ae,
+        ae_report = ae_report ae,
+        ae_pool = ae_pool ae,
+        ae_verbosity = ae_verbosity ae
       }
 
 
@@ -307,7 +303,7 @@ askActEnv :: Act o (ActEnv o)
 askActEnv = Act Reader.ask
 
 actVerbosity :: Act o Verbosity
-actVerbosity = fmap (se_verbosity . ae_global_env) askActEnv 
+actVerbosity = fmap ae_verbosity askActEnv 
 
 putStrLnAt :: Verbosity -> String -> Act o ()
 putStrLnAt at_verbosity msg = do
@@ -343,8 +339,10 @@ shake mx = withPool numCapabilities $ \pool -> do
     
     wdb_mvar <- newMVar emptyWaitDatabase
     report_mvar <- emptyReportDatabase >>= newMVar
-    
-    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_wait_database = wdb_mvar, se_report = report_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
+
+    -- Collect rules and wants, then execute the collected wants
+    let ((), final_s) = runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_wants = [] }) mx
+    (_time, _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = (), ae_verbosity = verbosity }) (AS { as_this_history = [] }) (need (ss_wants final_s))
     
     -- TODO: put report under command-line control
     final_report <- takeMVar report_mvar
@@ -435,13 +433,8 @@ ls :: FilePath -> Act StringOracle [FilePath]
 ls fp = queryStringOracle ("ls", fp)
 
 
--- TODO: Neil's example from his presentation only works if want doesn't actually build anything until the end (he wants before setting up any rules)
 want :: [FilePath] -> Shake o ()
-want fps = do
-    e <- askShakeEnv
-    s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need fps)
-    return ()
+want fps = modifyShakeState (\s -> s { ss_wants = fps ++ ss_wants s })
 
 (*>) :: Oracle o => String -> (FilePath -> Act o ()) -> Shake o ()
 (*>) pattern action = (compiled `match`) ?> action
@@ -487,8 +480,8 @@ withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -
 
 need' :: ActEnv o -> [FilePath] -> IO [(FilePath, ModTime)]
 need' e init_fps = do
-    let verbosity = se_verbosity (ae_global_env e)
-        db_mvar = se_database (ae_global_env e)
+    let verbosity = ae_verbosity e
+        db_mvar = ae_database e
         get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ fp ++ " was missing")) $ getFileModTime fp
 
     let -- We assume that the rules do not change to include new dependencies often: this lets
@@ -585,7 +578,7 @@ need' e init_fps = do
                         rule = do
                             (nested_hist, mtimes) <- basic_rule
                             -- This is where we mark all of the files created by the rule as Clean:
-                            markCleans (se_database (ae_global_env e)) nested_hist creates_fps mtimes
+                            markCleans (ae_database e) nested_hist creates_fps mtimes
                             -- Wake up all of the waiters on the old Building entry (if any)
                             awakeWaiters wait_handle
                             return mtimes
@@ -607,7 +600,7 @@ need' e init_fps = do
     -- NB: we report that the thread using parallel is blocked because it may go on to actually
     -- execute one of the parallel actions, which will bump the parallelism count without any
     -- extra parallelism actually occuring.
-    unclean_times <- fmap concat $ reportWorkerBlocked (se_report (ae_global_env e)) $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (se_report (ae_global_env e)) $ do
+    unclean_times <- fmap concat $ reportWorkerBlocked (ae_report e) $ parallel (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
@@ -621,10 +614,10 @@ need' e init_fps = do
             -- We can avoid a lot of fuss if the wait handle is already triggered so there can be no waiting...
             may_wait <- mayWaitOnWaitHandle wait_handle
             when may_wait $ 
-              reportWorkerBlocked (se_report (ae_global_env e)) $ 
-                registerWait (se_wait_database (ae_global_env e)) clean_fp wait_handle (ae_would_block_handles e) $
+              reportWorkerBlocked (ae_report e) $ 
+                registerWait (ae_wait_database e) clean_fp wait_handle (ae_would_block_handles e) $
                   -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
-                  extraWorkerWhileBlocked (se_pool (ae_global_env e)) (waitOnWaitHandle wait_handle)
+                  extraWorkerWhileBlocked (ae_pool e) (waitOnWaitHandle wait_handle)
         fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
     
     return $ unclean_times ++ clean_times
@@ -730,7 +723,7 @@ reportConcurrencyBump bump mvar_rdb act = Exception.bracket (bump_concurrency bu
 
 reportCommand :: String -> IO a -> Act o a
 reportCommand cmd act = do
-    mvar_rdb <- fmap (se_report . ae_global_env) askActEnv
+    mvar_rdb <- fmap ae_report askActEnv
     liftIO $ reportCommandIO mvar_rdb cmd act
 
 reportCommandIO :: MVar ReportDatabase -> String -> IO a -> IO a
