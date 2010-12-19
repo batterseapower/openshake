@@ -4,7 +4,7 @@ module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
     Rule, CreatesFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
-    want, oracle, modifyOracle,
+    want, act, oracle, modifyOracle,
     
     -- * Verbosity and command-line output from Shake
     Verbosity(..), actVerbosity, putStrLnAt,
