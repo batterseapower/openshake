@@ -442,9 +442,7 @@ instance Binary (Answer StringOracle) where
 defaultOracle :: StringOracle
 defaultOracle = SO go
   where
-    -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
-    --go ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
-    go ("ls", what) = fmap lines $ systemStdout' ("ls " ++ what)
+    go ("ls", what) = getCurrentDirectory >>= \cwd -> globDir1 (compile what) cwd
     go question     = shakefileError $ "The default oracle cannot answer the question " ++ show question
 
 queryStringOracle :: (String, String) -> Act StringOracle [String]
