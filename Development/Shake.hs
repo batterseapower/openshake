@@ -101,12 +101,12 @@ runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' 
 type CreatesFiles = [FilePath]
 type Rule o = FilePath -> Maybe (CreatesFiles, Act o ())
 
-type SomeRule = FilePath -> Maybe (CreatesFiles, SomeRuleAct)
-data SomeRuleAct = forall o. Oracle o => SomeRuleAct o (Act o ())
+type SomeRule = FilePath -> Maybe (CreatesFiles, SomeAct)
+data SomeAct = forall o. Oracle o => SomeAct o (Act o ())
 
 data ShakeState = SS {
     ss_rules :: [SomeRule],
-    ss_wants :: [FilePath]
+    ss_acts :: [SomeAct]
   }
 
 data ShakeEnv o = SE {
@@ -340,9 +340,11 @@ shake mx = withPool numCapabilities $ \pool -> do
     wdb_mvar <- newMVar emptyWaitDatabase
     report_mvar <- emptyReportDatabase >>= newMVar
 
-    -- Collect rules and wants, then execute the collected wants
-    let ((), final_s) = runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_wants = [] }) mx
-    (_time, _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = (), ae_verbosity = verbosity }) (AS { as_this_history = [] }) (need (ss_wants final_s))
+    -- Collect rules and wants, then execute the collected Act actions (in any order)
+    let ((), final_s) = runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_acts = [] }) mx
+    parallel_ pool $ flip map (ss_acts final_s) $ \(SomeAct o act) -> do
+        (_time, _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = o, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
+        return ()
     
     -- TODO: put report under command-line control
     final_report <- takeMVar report_mvar
@@ -433,8 +435,19 @@ ls :: FilePath -> Act StringOracle [FilePath]
 ls fp = queryStringOracle ("ls", fp)
 
 
-want :: [FilePath] -> Shake o ()
-want fps = modifyShakeState (\s -> s { ss_wants = fps ++ ss_wants s })
+-- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
+-- There is no guarantee about the order in which files will be built: in particular, files mentioned in one
+-- 'want' will not necessarily be built before we begin building files in the following 'want'.
+want :: Oracle o => [FilePath] -> Shake o ()
+want = act . need
+
+-- | Perform the specified action once we are done collecting rules in the 'Shake' monad.
+-- Just like 'want', there is no guarantee about the order in which the actions will be will be performed.
+act :: Oracle o => Act o () -> Shake o ()
+act what = do
+    o <- fmap se_oracle askShakeEnv
+    modifyShakeState (\s -> s { ss_acts = SomeAct o what : ss_acts s })
+
 
 (*>) :: Oracle o => String -> (FilePath -> Act o ()) -> Shake o ()
 (*>) pattern action = (compiled `match`) ?> action
@@ -467,7 +480,7 @@ addRule rule = do
     -- Note the contrast with using the oracle from the point at which need was called to
     -- invoke the rule, which is more akin to a dynamic scoping scheme.
     o <- fmap se_oracle $ askShakeEnv
-    modifyShakeState $ \s -> s { ss_rules = (fmap (second (SomeRuleAct o)) . rule) : ss_rules s }
+    modifyShakeState $ \s -> s { ss_rules = (fmap (second (SomeAct o)) . rule) : ss_rules s }
 
 need :: [FilePath] -> Act o ()
 need fps = do
@@ -789,7 +802,7 @@ findRule :: [SomeRule] -> FilePath
          -> (forall o. Oracle o => (o, CreatesFiles, ActEnv o' -> (IO (History, [(FilePath, ModTime)]))) -> IO r)
          -> IO r
 findRule rules fp k = case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
-  [(creates_fps, SomeRuleAct o action)] -> k (o, creates_fps, \e -> do
+  [(creates_fps, SomeAct o action)] -> k (o, creates_fps, \e -> do
       ((), final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
       
       creates_times <- forM creates_fps $ \creates_fp -> do
