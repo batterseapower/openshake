@@ -11,9 +11,11 @@ import Data.Char
 import Data.List
 import Data.Maybe
 
+import System.FilePath
+
 
 cppIncludes :: FilePath -> Act o [FilePath]
-cppIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
+cppIncludes fp = fmap (map (takeDirectory fp </>) . mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack
     -- FIXME: transitive dependencies
