@@ -14,6 +14,6 @@ main = shake $ do
         system' $ ["gcc","-o",x] ++ os
     "*.o" *> \x -> do
         let c = replaceExtension x "c"
-        need =<< cIncludes c
+        need =<< cppIncludes c
         system' ["gcc","-c",c,"-o",x]
     want ["Main"]

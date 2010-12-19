@@ -1,6 +1,7 @@
 module Development.Shake.System (
     system, system', systemStdout',
-    copy, mkdir, readFileLines
+    copy, mkdir, readFileLines,
+    quote
   ) where
 
 import Development.Shake

@@ -1,5 +1,5 @@
 module Development.Shake.C(
-    cIncludes
+    cppIncludes
   ) where
 
 import Development.Shake
@@ -12,8 +12,8 @@ import Data.List
 import Data.Maybe
 
 
-cIncludes :: FilePath -> Act o [FilePath]
-cIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
+cppIncludes :: FilePath -> Act o [FilePath]
+cppIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack
     -- FIXME: transitive dependencies
