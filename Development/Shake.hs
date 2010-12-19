@@ -1,6 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
+{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving, TypeOperators #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -35,6 +35,8 @@ import qualified Codec.Binary.UTF8.String as UTF8
 import Data.Typeable
 
 import Control.Applicative (Applicative)
+import Control.Arrow ((***))
+import Control.Category (Category(..))
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -63,6 +65,8 @@ import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
 import GHC.Conc (numCapabilities)
+
+import Prelude hiding (id, (.))
 
 
 -- | Verbosity level: higher is more verbose. Levels are as follows:
@@ -95,6 +99,13 @@ shakefileError s = error $ "Your Shakefile contained an error: " ++ s
 
 internalError :: String -> a
 internalError s = error $ "Internal Shake error: " ++ s
+
+
+data a :< b = ST { sup :: a -> b, sub :: b -> Maybe a }
+
+instance Category (:<) where
+    id = ST id Just
+    st1 . st2 = ST (sup st1 . sup st2) (\x -> sub st1 x >>= sub st2)
 
 
 runGetAll :: Get a -> BS.ByteString -> a
@@ -516,7 +527,7 @@ want' :: Namespace n => [n] -> Shake n o ()
 want' fps = do
     e <- askShakeEnv
     s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need' fps)
+    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need' (id, id) fps)
     return ()
 
 (*>) :: Oracle o => String -> (FilePath -> Act FileName o ()) -> Shake FileName o ()
@@ -546,7 +557,7 @@ addRule rule = addRule' (\o -> fmap (generator_act o) . rule . unFN)
     generator_act :: Oracle o => o -> (CreatesFiles, Act FileName o ()) -> Generator FileName
     generator_act o (creates_fps, act) = (,) (map FN creates_fps) $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) (FN fp)) (liftIO $ getCleanFileModTime fp)) creates_fps
 
-addRule' :: Oracle o => (o -> SomeRule n) -> Shake n o ()
+addRule' :: Oracle o => (o -> SomeRule n) -> Shake nt o ()
 addRule' rule = do
     -- NB: we store the oracle with the rule to implement "lexical scoping" for oracles.
     -- Basically, the oracle in effect when we run some rules action should be the oracle
@@ -558,16 +569,26 @@ addRule' rule = do
     o <- fmap se_oracle $ askShakeEnv
     modifyShakeState $ \s -> s { ss_rules = rule o : ss_rules s }
 
+-- supSomeRule :: (n :< nt, Entry n :< Entry nt) -> SomeRule n -> SomeRule nt
+-- supSomeRule (stn, ste) rule nt = do
+--     n <- sub stn nt
+--     (creates_ns, GeneratorAct o act) <- rule n
+--     let act' = fmap (map (sup stn *** sup ste)) $ supAct (stn, ste) act
+--     return (map (sup stn) creates_ns, GeneratorAct o act')
+-- 
+-- supAct :: (n :< nt, Entry n :< Entry nt) -> Act n o a -> Act nt o a
+-- supAct (stn, ste) act = Act $ Reader.ReaderT $ \e -> State.StateT $ \s -> State.runStateT (Reader.runReaderT (unAct act) (undefined e)) (undefined s) >>= \(x, s') -> return (x, undefined s')
+
 getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
 need :: [FilePath] -> Act FileName o ()
-need = need' . map FN
+need = need' (id, id) . map FN
 
-need' :: Namespace n => [n] -> Act n o ()
-need' fps = do
+need' :: Namespace nt => (n :< nt, Entry n :< Entry nt) -> [n] -> Act nt o ()
+need' (stn, _) fps = do
     e <- askActEnv
-    need_times <- liftIO $ need'' e fps
+    need_times <- liftIO $ need'' e (map (sup stn) fps)
     appendHistory $ Need $ need_times
 
 withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
