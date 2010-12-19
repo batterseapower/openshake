@@ -41,14 +41,32 @@ systemStdout prog = do
     reportCommand cmd $ Utilities.systemStdout cmd
   where cmd = intercalate " " prog
 
+control_characters, meta_characters :: [Char]
+control_characters = ['$', '`']
+meta_characters = [' ', '\t', '|', '&', ';', '(', ')', '<', '>']
+
+-- | Shell escaping by double-quoting the argument.
+--
+-- See 3.1.2.3 of <http://www.gnu.org/software/bash/manual/bashref.html>
+quote :: String -> String
+quote x = "\"" ++ concatMap escape x ++ "\""
+  where must_escape = control_characters ++ ['\"', '\\']
+        escape c | c `elem` must_escape = ['\\', c]
+                 | otherwise            = [c]
+
+-- | Shell escaping by backslash-encoding the argument.
+--
+-- See 3.1.2.1 of <http://www.gnu.org/software/bash/manual/bashref.html#Definitions>
+escape :: String -> String
+escape x = concatMap escape x
+  where must_escape = control_characters ++ meta_characters ++ ['\\', '\'', '\"']
+        escape c | c `elem` must_escape = ['\\', c] -- TODO: I'm not using this at the moment
+                 | otherwise            = [c]
 
 readFileLines :: FilePath -> Act o [String]
 readFileLines x = do
     need [x]
     liftIO $ fmap lines $ readFile x
-
-quote :: String -> String
-quote x = "\"" ++ x ++ "\"" -- TODO: this is probably wrong
 
 copy :: FilePath -> FilePath -> Act o ()
 copy from to = do
