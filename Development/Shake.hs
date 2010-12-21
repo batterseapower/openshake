@@ -202,12 +202,14 @@ prepareStatus (Building mb_hist _) = mb_hist
 prepareStatus (Dirty hist)         = Just hist
 prepareStatus (Clean hist _ )      = Just hist
 
+type ShakeWaitHandle = WaitHandle [(CanonicalFilePath, ModTime)]
+
 -- NB: use of the Clean constructor is just an optimisation that means we don't have to recursively recheck dependencies
 -- whenever a file is need -- instead we can cut the checking process off if we discover than a file is marked as Clean.
 -- Of course, this might go a bit wrong if the file becomes invalidated *during a Shake run*, but we accept that risk.
 data Status = Dirty History
             | Clean History ModTime
-            | Building (Maybe History) WaitHandle
+            | Building (Maybe History) ShakeWaitHandle
             deriving (Show)
 
 instance NFData Status where
@@ -283,9 +285,9 @@ data ActState = AS {
   }
 
 data ActEnv o = AE {
-    ae_oracle :: o,                         -- ^ The oracle for the 'Act' to use when querying
-    ae_would_block_handles :: [WaitHandle], -- ^ A list of handles that would be incapable of awakening if the action were to
-                                            --   block indefinitely here and now. This is used in the deadlock detector.
+    ae_oracle :: o,                              -- ^ The oracle for the 'Act' to use when querying
+    ae_would_block_handles :: [ShakeWaitHandle], -- ^ A list of handles that would be incapable of awakening if the action were to
+                                                 --   block indefinitely here and now. This is used in the deadlock detector.
     ae_global_rules :: [SomeRule],
     ae_database :: Database,
     ae_wait_database :: MVar WaitDatabase,
@@ -524,12 +526,11 @@ need' :: ActEnv o -> [CanonicalFilePath] -> IO [(CanonicalFilePath, ModTime)]
 need' e init_fps = do
     let verbosity = ae_verbosity e
         db_mvar = ae_database e
-        get_clean_mod_time fp = fmap (fromMaybe (internalError $ "The clean file " ++ show fp ++ " was missing")) $ getFileModTime (filePath fp)
 
     let -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
         -- of the rule have not changed
-        history_requires_rerun :: [WaitHandle] -> Oracle o => o -> QA -> IO (Maybe String)
+        history_requires_rerun :: [ShakeWaitHandle] -> Oracle o => o -> QA -> IO (Maybe String)
         history_requires_rerun _ o (Oracle td bs_q bs_a) = 
             case peekOracle td bs_q bs_a of
                 Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
@@ -552,12 +553,12 @@ need' e init_fps = do
             return $ firstJust $ (\f -> zipWith f relevant_nested_new_times nested_old_times) $
                 \(fp, old_time) new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
     
-        find_all_rules :: [(CanonicalFilePath, Maybe WaitHandle)]
+        find_all_rules :: [(CanonicalFilePath, Either ShakeWaitHandle ModTime)]
                        -> [([CanonicalFilePath], [CanonicalFilePath], IO [(CanonicalFilePath, ModTime)])]
                        -> [CanonicalFilePath]
-                       -> [WaitHandle]
+                       -> [ShakeWaitHandle]
                        -> PureDatabase
-                       -> IO (PureDatabase, ([(CanonicalFilePath, Maybe WaitHandle)],
+                       -> IO (PureDatabase, ([(CanonicalFilePath, Either ShakeWaitHandle ModTime)],
                                              [([CanonicalFilePath], IO [(CanonicalFilePath, ModTime)])]))
         find_all_rules pending_cleans pending_uncleans [] _ db = do
             -- Display a helpful message to the user explaining the rules that we have decided upon:
@@ -572,11 +573,11 @@ need' e init_fps = do
             let ei_unclean_clean = case M.lookup fp db of
                   Nothing                     -> Left Nothing
                   Just (Dirty hist)           -> Left (Just hist)
-                  Just (Clean _ _)            -> Right Nothing
-                  Just (Building _ wait_mvar) -> Right (Just wait_mvar)
+                  Just (Clean _ mtime)        -> Right (Right mtime)
+                  Just (Building _ wait_mvar) -> Right (Left wait_mvar)
             
             case ei_unclean_clean of
-                Right mb_mvar -> find_all_rules ((fp, mb_mvar) : pending_cleans) pending_uncleans fps would_block_handles db
+                Right ei_mvar_mtime -> find_all_rules ((fp, ei_mvar_mtime) : pending_cleans) pending_uncleans fps would_block_handles db
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
@@ -636,7 +637,7 @@ need' e init_fps = do
                             -- This is where we mark all of the files created by the rule as Clean:
                             markCleans (ae_database e) nested_hist creates_fps mtimes
                             -- Wake up all of the waiters on the old Building entry (if any)
-                            awakeWaiters wait_handle
+                            awakeWaiters wait_handle mtimes
                             return mtimes
     
                     -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
@@ -662,19 +663,19 @@ need' e init_fps = do
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
         return $ snd $ lookupMany (\unclean_fp -> internalError $ "We should have reported the modification time for the rule file " ++ show unclean_fp) unclean_fps mtimes
     
-    -- TODO: could communicate ModTime of clean file via the WaitHandle... more elegant?
-    clean_times <- forM cleans $ \(clean_fp, mb_wait_handle) -> do
-        case mb_wait_handle of
-          Nothing -> return ()
-          Just wait_handle -> do
+    -- NB: we communicate ModTime of clean files via the WaitHandle... more elegant!
+    clean_times <- forM cleans $ \(clean_fp, ei_wait_handle_mtime) -> do
+        fmap ((,) clean_fp) $ case ei_wait_handle_mtime of
+          Right mtime -> return mtime
+          Left wait_handle -> do
             -- We can avoid a lot of fuss if the wait handle is already triggered so there can be no waiting...
             may_wait <- mayWaitOnWaitHandle wait_handle
-            when may_wait $ 
-              reportWorkerBlocked (ae_report e) $ 
-                registerWait (ae_wait_database e) (show clean_fp) wait_handle (ae_would_block_handles e) $
-                  -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
-                  extraWorkerWhileBlocked (ae_pool e) (waitOnWaitHandle wait_handle)
-        fmap ((,) clean_fp) (get_clean_mod_time clean_fp)
+            -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+            let report | may_wait  = reportWorkerBlocked (ae_report e) . registerWait (ae_wait_database e) (show clean_fp) wait_handle (ae_would_block_handles e)
+                       | otherwise = id
+            
+            mtimes <- report $ extraWorkerWhileBlocked (ae_pool e) (waitOnWaitHandle wait_handle)
+            return $ fromMaybe (internalError $ "Did not report a modification time for the created file " ++ show clean_fp) $ lookup clean_fp mtimes
     
     return $ unclean_times ++ clean_times
 
@@ -687,13 +688,13 @@ type WaitNumber = Int
 --
 -- We record a 'WaitNumber' with each entry so that we can unregister a wait that we previously
 -- added without interfering with information that has been added in the interim.
-type BlockedWaitHandle = (WaitNumber, String, WaitHandle)
+type BlockedWaitHandle = (WaitNumber, String, ShakeWaitHandle)
 
 -- | Mapping from 'WaitHandle's being awaited upon to the 'WaitHandle's blocked
 -- from being awoken as a consequence of that waiting.
 data WaitDatabase = WDB {
     wdb_next_waitno :: WaitNumber,
-    wdb_waiters :: [(WaitHandle, [BlockedWaitHandle])]
+    wdb_waiters :: [(ShakeWaitHandle, [BlockedWaitHandle])]
   }
 
 emptyWaitDatabase :: WaitDatabase
@@ -715,7 +716,7 @@ emptyWaitDatabase = WDB {
 --
 -- In this situation we throw an error instead of actually performing the wait, including in the error a descripton
 -- of the dependency chain that lead to the error reconstructed from the individual wait "why" information.
-registerWait :: MVar WaitDatabase -> String -> WaitHandle -> [WaitHandle] -> IO a -> IO a
+registerWait :: MVar WaitDatabase -> String -> ShakeWaitHandle -> [ShakeWaitHandle] -> IO a -> IO a
 registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.bracket register unregister (\_ -> act)
   where
     register = modifyMVar mvar_wdb (Exception.evaluate . register')
@@ -731,12 +732,12 @@ registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.
                                                    find_blocked_wait_handles new_handle) :
                                       filter ((/= new_handle) . fst) waiters
         
-        find_blocked_wait_handles :: WaitHandle -> [BlockedWaitHandle]
+        find_blocked_wait_handles :: ShakeWaitHandle -> [BlockedWaitHandle]
         find_blocked_wait_handles wait_handle = fromMaybe [] (wait_handle `lookup` waiters)
         
         -- When we compute whether we are blocked, we need to do a transitive closure. This is necessary for situations where
         -- e.g. A.o -> B.o -> C.o, because we need to see that A.o is waiting on C.o's WaitHandle through B.o's WaitHandle.
-        transitive :: [([FilePath], WaitHandle)] -> [([FilePath], WaitHandle)]
+        transitive :: [([FilePath], ShakeWaitHandle)] -> [([FilePath], ShakeWaitHandle)]
         transitive init_blocked = flip fixEq init_blocked $ \blocked -> nub $ blocked ++ [ (why : why_chain, next_blocked_handle)
                                                                                          | (why_chain, blocked_handle) <- blocked
                                                                                          , (_waitno, why, next_blocked_handle) <- find_blocked_wait_handles blocked_handle ]
