@@ -603,25 +603,32 @@ need' e init_fps = do
                     -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
                     would_block_handles <- return $ wait_handle : would_block_handles
     
-                    (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing   -> return (db, Right "file was not in the database")
-                                                                        Just hist -> withoutMVar db_mvar db $ fmap (maybe (Left hist) Right) $ firstJustM $ map (history_requires_rerun would_block_handles potential_o) hist
-                    mb_clean_hist <- case ei_clean_hist_dirty_reason of
-                      Left clean_hist -> return (Just clean_hist)
+                    (db, ei_clean_hist_dirty_reason) <- case mb_hist of
+                        Nothing   -> return (db, Right "file was not in the database")
+                        Just hist -> withoutMVar db_mvar db $ do
+                            mb_dirty_reason <- firstJustM $ map (history_requires_rerun would_block_handles potential_o) hist
+                            case mb_dirty_reason of
+                                Just reason -> return $ Right reason
+                                Nothing     -> do
+                                  mb_mtime <- getFileModTime (filePath fp)
+                                  return $ case mb_mtime of
+                                      Nothing    -> Right "file in the database but missing on disk"
+                                      Just mtime -> Left (mtime, hist)
+                    mb_clean_info <- case ei_clean_hist_dirty_reason of
+                      Left clean_info -> return (Just clean_info)
                       Right dirty_reason -> do
                         when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
                         return Nothing
                   
-                    let (creates_fps, basic_rule) = case mb_clean_hist of
+                    let (creates_fps, basic_rule) = case mb_clean_info of
                           -- Each rule we execute will block the creation of some files if it waits:
                           --   * It blocks the creation the files it *directly outputs*
                           --   * It blocks the creation of those files that will be created *by the caller* (after we return)
                           --
                           -- Note that any individual rule waiting *does not* block the creation of files built by other rules
                           -- being run right. This is because everything gets executed in parallel.
-                          Nothing         -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = wait_handle : ae_would_block_handles e }))
-                          Just clean_hist -> ([fp], do
-                            nested_time <- get_clean_mod_time fp
-                            return (clean_hist, [(fp, nested_time)]))
+                          Nothing                        -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = wait_handle : ae_would_block_handles e }))
+                          Just (clean_mtime, clean_hist) -> ([fp], return (clean_hist, [(fp, clean_mtime)]))
                       
                         -- Augment the rule so that when it is run it sets all of the things it built to Clean again
                         rule = do
