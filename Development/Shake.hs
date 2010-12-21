@@ -580,7 +580,7 @@ need' e init_fps = do
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-                  findRule (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
+                  findRule verbosity (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
                     -- 1) Basic sanity check that the rule creates the file we actually need
                     unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
     
@@ -843,19 +843,24 @@ mapMaybeM f = go
             Just y  -> liftM (y:) (go xs)
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-findRule :: [SomeRule] -> CanonicalFilePath
+findRule :: Verbosity -> [SomeRule] -> CanonicalFilePath
          -> (forall o. Oracle o => (o, [CanonicalFilePath], ActEnv o' -> (IO (History, [(CanonicalFilePath, ModTime)]))) -> IO r)
          -> IO r
-findRule rules fp k = do
+findRule verbosity rules fp k = do
     possibilities <- mapMaybeM ($ fp) rules
-    case possibilities of
-      [(creates_fps, SomeAct o action)] -> k (o, creates_fps, \e -> do
-          ((), final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
-      
-          creates_times <- forM creates_fps $ \creates_fp -> do
-              nested_time <- fmap (fromMaybe $ shakefileError $ "The matching rule did not create " ++ show creates_fp) $ liftIO $ getFileModTime (filePath creates_fp)
-              return (creates_fp, nested_time)
-          return (as_this_history final_nested_s, creates_times))
+    -- To make sure we choose the first rule, we need to reverse the list of matches (we add them in reverse order)
+    case reverse possibilities of
+      (creates_fps, SomeAct o action):other_matches -> do
+          unless (null other_matches) $
+            when (verbosity > NormalVerbosity) $
+              putStrLn $ "Ambiguous rules for " ++ show fp ++ ": choosing the first one"
+          k (o, creates_fps, \e -> do
+              ((), final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
+              
+              creates_times <- forM creates_fps $ \creates_fp -> do
+                  nested_time <- fmap (fromMaybe $ shakefileError $ "The matching rule did not create " ++ show creates_fp) $ liftIO $ getFileModTime (filePath creates_fp)
+                  return (creates_fp, nested_time)
+              return (as_this_history final_nested_s, creates_times))
       [] -> do
           -- Not having a rule might still be OK, as long as there is some existing file here:
           mb_nested_time <- getFileModTime (filePath fp)
@@ -865,7 +870,6 @@ findRule rules fp k = do
               -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
               -- check will catch the change.
               Just nested_time -> k ((), [fp], \_ -> return ([], [(fp, nested_time)])) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-      _actions -> shakefileError $ "Ambiguous rules for " ++ show fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
 
 oracle :: o' -> Shake o' a -> Shake o a
 oracle o' = modifyOracle (const o')
