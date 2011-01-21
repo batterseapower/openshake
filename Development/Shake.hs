@@ -21,7 +21,7 @@ module Development.Shake (
     reportCommand
   ) where
 
-import Development.Shake.Core hiding (shake, addRule, need)
+import Development.Shake.Core hiding (Rule, shake, addRule, need)
 import qualified Development.Shake.Core as Core
 
 import Development.Shake.Core.Binary
@@ -187,8 +187,9 @@ instance Oracle o => Binary (ShakeEntry o) where
     put (OracleAnswer a) = putWord8 1 >> put a
 
 
-instance Oracle o => Namespace (ShakeName o) where
-    type Entry (ShakeName o) = ShakeEntry o
+instance Namespace CanonicalFilePath where
+    type Entry CanonicalFilePath = ModTime
+    
     -- In standard Shake, we would:
     --   * Not sanity check anything
     --   * Recover the ModTime by looking at the file modification time
@@ -198,12 +199,9 @@ instance Oracle o => Namespace (ShakeName o) where
     --   * Cache the ModTime
     --   * Sanity check the current ModTime against the current one
     --   * Thus we detect changes in this file since the last run, so changed files will be rebuilt even if their dependents haven't changed
-    sanityCheck (OracleQuestion _) _ = return Nothing -- No way to sanity check oracle question without running it. TODO: check type?
-    sanityCheck (File fp) (FileModTime old_mtime) = getFileModTime (filePath fp) >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
-     -- TODO: how to deal with apparently non-exhaustive patterns like this one?
+    sanityCheck fp old_mtime = getFileModTime (filePath fp) >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
     
-    defaultRule (OracleQuestion _) = return Nothing -- No default way to answer oracle questions
-    defaultRule (File fp) = do
+    defaultRule fp = do
         -- Not having a rule might still be OK, as long as there is some existing file here:
         mb_nested_time <- getFileModTime (filePath fp)
         case mb_nested_time of
@@ -211,7 +209,17 @@ instance Oracle o => Namespace (ShakeName o) where
             -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
             -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
             -- check will catch the change.
-            Just nested_time -> return $ Just ([File fp], return [FileModTime nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+            Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+
+instance Oracle o => Namespace (ShakeName o) where
+    type Entry (ShakeName o) = ShakeEntry o
+
+    sanityCheck (OracleQuestion _) _ = return Nothing -- No way to sanity check oracle question without running it. TODO: check type?
+    sanityCheck (File fp) (FileModTime old_mtime) = sanityCheck fp old_mtime
+     -- TODO: how to deal with apparently non-exhaustive patterns like this one?
+    
+    defaultRule (OracleQuestion _) = return Nothing -- No default way to answer oracle questions
+    defaultRule (File fp) = liftRule defaultRule (File fp)
 
 
 -- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
@@ -242,15 +250,20 @@ want = act . need
 (?@>) p action = addRule $ \fp -> p fp >>= \creates -> return (creates, action fp)
 
 
-addRule :: Rule o -> Shake (ShakeName o) ()
-addRule rule = Core.addRule go
+
+liftRule :: Core.Rule' ntop CanonicalFilePath -> Core.Rule' ntop (ShakeName o)
+liftRule _    (OracleQuestion _) = return Nothing
+liftRule rule (File fp) = liftM (fmap f) $ rule fp
   where
-    go (OracleQuestion _) = return Nothing
-    go (File fp) = do
-      cwd <- getCurrentDirectory
-      flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
-          creates <- mapM (canonical . (cwd </>)) creates
-          return (map File creates, act >> mapM (liftM FileModTime . liftIO . getCleanFileModTime . filePath) creates)
+    f :: Generator' ntop CanonicalFilePath -> Generator' ntop (ShakeName o)
+    f (creates, act) = (map File creates, liftM (map FileModTime) act)
+
+addRule :: Rule o -> Shake (ShakeName o) ()
+addRule rule = Core.addRule $ liftRule $ \fp -> do
+    cwd <- getCurrentDirectory
+    flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
+        creates <- mapM (canonical . (cwd </>)) creates
+        return (creates, act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
 
 getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp

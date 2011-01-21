@@ -7,7 +7,7 @@ module Development.Shake.Core (
     addRule, act,
 
     -- * Rules
-    SomeRule, Generator,
+    Rule, Rule', Generator, Generator',
     
     -- * Verbosity and command-line output from Shake
     Verbosity(..), actVerbosity, putStrLnAt,
@@ -102,16 +102,18 @@ class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), 
     -- TODO: I could just do the IO in the Act monad and delay the error a little bit.
     --
     -- The default implementation is not to have a default rule.
-    defaultRule :: n -> IO (Maybe (Generator n))
+    defaultRule :: Rule' ntop n
     defaultRule _ = return Nothing
 
 
-type SomeRule n = n -> IO (Maybe (Generator n))
+type Rule' ntop n = n -> IO (Maybe (Generator' ntop n))
+type Rule n = Rule' n n
 
-type Generator n = ([n], Act n [Entry n])
+type Generator' ntop n = ([n], Act ntop [Entry n])
+type Generator n = Generator' n n
 
 data ShakeState n = SS {
-    ss_rules :: [SomeRule n],
+    ss_rules :: [Rule n],
     ss_acts :: [Act n ()]
   }
 
@@ -194,7 +196,7 @@ data ActState n = AS {
 data ActEnv n = AE {
     ae_would_block_handles :: [WaitHandle ()], -- ^ A list of handles that would be incapable of awakening if the action were to
                                                --   block indefinitely here and now. This is used in the deadlock detector.
-    ae_global_rules :: [SomeRule n],
+    ae_global_rules :: [Rule n],
     ae_database :: Database n,
     ae_wait_database :: MVar (WaitDatabase n),
     ae_report :: MVar ReportDatabase,
@@ -279,7 +281,7 @@ act :: Act n () -> Shake n ()
 act what = modifyShakeState (\s -> s { ss_acts = what : ss_acts s })
 
 
-addRule :: SomeRule n -> Shake n ()
+addRule :: Rule n -> Shake n ()
 addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 
 need :: Namespace n => [n] -> Act n [Entry n]
@@ -594,7 +596,7 @@ appendHistory :: QA n -> Act n ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-type RuleFinder n = forall r. Verbosity -> [SomeRule n] -> n
+type RuleFinder n = forall r. Verbosity -> [Rule n] -> n
                            -> (([n], ActEnv n -> (IO (History n, [Entry n]))) -> IO r)
                            -> IO r
 findRule :: Namespace n => RuleFinder n
