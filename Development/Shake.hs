@@ -1,6 +1,5 @@
 {-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables, TypeOperators, MultiParamTypeClasses #-}
 {-# LANGUAGE OverlappingInstances #-} -- For the subtyping magic
-{-# LANGUAGE ViewPatterns #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -251,6 +250,16 @@ fromRightEntry :: UnionEntry n1 n2 -> Maybe (Entry n2)
 fromRightEntry = \n -> case n of LeftEntry _ -> Nothing; RightEntry n2 -> Just n2
 
 
+-- | Generic version of 'need' for building anything at all
+need' :: forall ntop n. (n :< ntop, Namespace ntop) => [n] -> Act ntop [Entry n]
+need' ns = do
+    top_es <- Core.need $ map up_name ns
+    let Just es = mapM down_entry top_es
+    return  es
+  where (_down_name :: ntop -> Maybe n, down_entry) = downcast
+        (up_name :: n -> ntop, _up_entry) = upcast
+
+
 -- Needing and adding rules for files
 
 (*>) :: (CanonicalFilePath :< ntop, Namespace ntop)
@@ -290,7 +299,7 @@ addRule rule = Core.addRule $ liftRule $ \fp -> do
     getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
 need :: (CanonicalFilePath :< ntop, Namespace ntop) => [FilePath] -> Act ntop ()
-need fps = liftIO (mapM (liftM (fst upcast) . canonical) fps) >>= \fps -> Core.need fps >> return ()
+need fps = liftIO (mapM canonical fps) >>= \fps -> need' fps >> return ()
 
 -- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
 -- There is no guarantee about the order in which files will be built: in particular, files mentioned in one
@@ -304,12 +313,11 @@ want = act . need
 installOracle :: (Oracle o, Question o :< ntop) => o -> Shake ntop ()
 installOracle o = Core.addRule $ liftRule $ \q -> return $ Just ([q], fmap return $ liftIO $ queryOracle o q)
 
-query :: forall ntop o. (Oracle o, Question o :< ntop, Namespace ntop) => Question o -> Act ntop (Answer o)
-query q = do
-    [down_entry -> Just a] <- Core.need [up_name q]
-    return a
-  where (_down_name :: ntop -> Maybe (Question o), down_entry) = downcast
-        (up_name :: Question o -> ntop, _up_entry) = upcast
+-- | Query the oracle.
+--
+-- (I've taken a bit of a liberty here and kept the type general so you can actually just use this as a need of arity 1)
+query :: (n :< ntop, Namespace ntop) => n -> Act ntop (Entry n)
+query n = fmap (\[e] -> e) $ need' [n]
 
 queryStringOracle :: (Question StringOracle :< ntop, Namespace ntop) => (String, String) -> Act ntop [String]
 queryStringOracle = fmap unSA . query . SQ
