@@ -1,4 +1,5 @@
-{-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables, TypeOperators, MultiParamTypeClasses #-}
+{-# LANGUAGE OverlappingInstances #-} -- For the subtyping magic
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -249,21 +250,47 @@ want = act . need
 
 
 
-liftLeftRule :: forall ntop n1 n2. Core.Rule' ntop n1 -> Core.Rule' ntop (UnionName n1 n2)
-liftLeftRule = liftRule (\n -> case n of RightName _ -> Nothing; LeftName n1 -> Just n1) LeftName LeftEntry
+liftLeftRule :: Core.Rule' ntop n1 -> Core.Rule' ntop (UnionName n1 n2)
+liftLeftRule = liftRule
 
 liftRightRule :: forall ntop n1 n2. Core.Rule' ntop n2 -> Core.Rule' ntop (UnionName n1 n2)
-liftRightRule = liftRule (\n -> case n of LeftName _ -> Nothing; RightName n2 -> Just n2) RightName RightEntry
+liftRightRule = liftRule' fromRightName (RightName, RightEntry) -- TODO: cannot get instance search working here
 
-liftRule :: forall ntop nsup nsub.
-            (nsup -> Maybe nsub)
-         -> (nsub -> nsup)
-         -> (Entry nsub -> Entry nsup)
-         -> Core.Rule' ntop nsub
-         -> Core.Rule' ntop nsup
-liftRule xtract inject_n inject_e rule ntop = case xtract ntop of
+
+
+liftRule :: (nsub :< nsup) => Core.Rule' ntop nsub -> Core.Rule' ntop nsup
+liftRule = liftRule' downcast upcast
+
+liftRule' :: (nsup -> Maybe nsub)
+          -> (nsub -> nsup, Entry nsub -> Entry nsup)
+          -> Rule' ntop nsub -> Rule' ntop nsup
+liftRule' downcast upcast rule ntop = case downcast ntop of
     Nothing -> return Nothing
-    Just n -> liftM (fmap (\(creates, act) -> (map inject_n creates, liftM (map inject_e) act))) $ rule n
+    Just n -> liftM (fmap (\(creates, act) -> let (name, entry) = upcast in (map name creates, liftM (map entry) act))) $ rule n
+
+
+class (:<) nsub nsup where
+    downcast :: nsup -> Maybe nsub
+    upcast :: (nsub -> nsup, Entry nsub -> Entry nsup) -- Stuff the two functions together to sidestep non-injectivitity of Entry
+
+instance (:<) n n where
+    downcast = Just
+    upcast = (id, id)
+
+instance (:<) n1 (UnionName n1 n2) where
+    downcast = fromLeftName
+    upcast = (LeftName, LeftEntry)
+
+instance ((:<) n1 n3) => (:<) n1 (UnionName n2 n3) where
+    downcast n = fromRightName n >>= downcast
+    upcast = (RightName . name, RightEntry . entry)
+      where (name, entry) = upcast
+
+fromLeftName :: UnionName n1 n2 -> Maybe n1
+fromLeftName = \n -> case n of RightName _ -> Nothing; LeftName n1 -> Just n1
+
+fromRightName :: UnionName n1 n2 -> Maybe n2
+fromRightName = \n -> case n of LeftName _ -> Nothing; RightName n2 -> Just n2
 
 
 addRule :: Rule o -> Shake (ShakeName o) ()
