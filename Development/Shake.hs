@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, DeriveDataTypeable, StandaloneDeriving, FlexibleContexts, FlexibleInstances #-}
+{-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, DeriveDataTypeable, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -95,7 +95,8 @@ canonical fp = do
       else fmap (UnsafeCanonicalise . (</> fp)) getCurrentDirectory
 
 
-class (Eq (Question o), Eq (Answer o),
+class (Namespace (Question o), -- TODO: subsumes a lot of other stuff
+       Eq (Question o), Eq (Answer o),
        Ord (Question o),
        Binary (Question o), Binary (Answer o),
        Show (Question o), Show (Answer o),       -- Show is only required for nice debugging output
@@ -124,6 +125,12 @@ instance Binary (Answer StringOracle) where
     get = fmap SA $ getList getUTF8String
     put = putList putUTF8String . unSA
 
+instance Oracle o => Namespace (Question o) where
+    type Entry (Question o) = Answer o
+
+    sanityCheck _ _ = return Nothing -- No way to sanity check oracle question without running it
+    defaultRule _ = return Nothing -- No default way to answer oracle questions
+
 
 defaultOracle :: StringOracle
 defaultOracle = SO go
@@ -138,53 +145,53 @@ ls :: FilePath -> Act (ShakeName StringOracle) [FilePath]
 ls fp = queryStringOracle ("ls", fp)
 
 
-data ShakeName o = File CanonicalFilePath
-                 | OracleQuestion (Question o)
+data UnionName n1 n2 = LeftName n1 | RightName n2
 
-instance Oracle o => Show (ShakeName o) where
-    show (File fp) = show fp
-    show (OracleQuestion q) = show q
+type ShakeName o = UnionName (Question o) CanonicalFilePath
 
-deriving instance Oracle o => Eq (ShakeName o)
-deriving instance Oracle o => Ord (ShakeName o)
+instance (Namespace n1, Namespace n2) => Show (UnionName n1 n2) where
+    show (LeftName n1) = show n1
+    show (RightName n2) = show n2
 
-instance Oracle o => NFData (ShakeName o) where
-    rnf (File a) = rnf a
-    rnf (OracleQuestion a) = rnf a
+deriving instance (Namespace n1, Namespace n2) => Eq (UnionName n1 n2)
+deriving instance (Namespace n1, Namespace n2) => Ord (UnionName n1 n2)
 
-instance Oracle o => Binary (ShakeName o) where
+instance (Namespace n1, Namespace n2) => NFData (UnionName n1 n2) where
+    rnf (LeftName a) = rnf a
+    rnf (RightName a) = rnf a
+
+instance (Namespace n1, Namespace n2) => Binary (UnionName n1 n2) where
     get = do
         tg <- getWord8
         case tg of
-          0 -> liftM File get
-          1 -> liftM OracleQuestion get
-          _ -> error "get{ShakeName o}: unknown tag"
-    put (File fp) = putWord8 0 >> put fp
-    put (OracleQuestion q) = putWord8 1 >> put q
+          0 -> liftM LeftName get
+          1 -> liftM RightName get
+          _ -> error "get{UnionName n1 n2}: unknown tag"
+    put (LeftName n1) = putWord8 0 >> put n1
+    put (RightName n2) = putWord8 1 >> put n2
 
 
-data ShakeEntry o = FileModTime ModTime
-                  | OracleAnswer (Answer o)
+data UnionEntry n1 n2 = LeftEntry (Entry n1) | RightEntry (Entry n2)
 
-deriving instance Oracle o => Eq (ShakeEntry o)
+deriving instance (Namespace n1, Namespace n2) => Eq (UnionEntry n1 n2)
 
-instance Oracle o => Show (ShakeEntry o) where
-    show (FileModTime mtime) = show mtime
-    show (OracleAnswer a) = show a
+instance (Namespace n1, Namespace n2) => Show (UnionEntry n1 n2) where
+    show (LeftEntry e1) = show e1
+    show (RightEntry e2) = show e2
 
-instance Oracle o => NFData (ShakeEntry o) where
-    rnf (FileModTime a) = rnf a
-    rnf (OracleAnswer a) = rnf a
+instance (Namespace n1, Namespace n2) => NFData (UnionEntry n1 n2) where
+    rnf (LeftEntry a) = rnf a
+    rnf (RightEntry a) = rnf a
 
-instance Oracle o => Binary (ShakeEntry o) where
+instance (Namespace n1, Namespace n2) => Binary (UnionEntry n1 n2) where
     get = do
         tg <- getWord8
         case tg of
-          0 -> liftM FileModTime get
-          1 -> liftM OracleAnswer get
-          _ -> error "get{ShakeEntry o}: unknown tag"
-    put (FileModTime mtime) = putWord8 0 >> put mtime
-    put (OracleAnswer a) = putWord8 1 >> put a
+          0 -> liftM LeftEntry get
+          1 -> liftM RightEntry get
+          _ -> error "get{UnionEntry n1 n2}: unknown tag"
+    put (LeftEntry e1) = putWord8 0 >> put e1
+    put (RightEntry e2) = putWord8 1 >> put e2
 
 
 instance Namespace CanonicalFilePath where
@@ -211,15 +218,15 @@ instance Namespace CanonicalFilePath where
             -- check will catch the change.
             Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
 
-instance Oracle o => Namespace (ShakeName o) where
-    type Entry (ShakeName o) = ShakeEntry o
+instance (Namespace n1, Namespace n2) => Namespace (UnionName n1 n2) where
+    type Entry (UnionName n1 n2) = UnionEntry n1 n2
 
-    sanityCheck (OracleQuestion _) _ = return Nothing -- No way to sanity check oracle question without running it. TODO: check type?
-    sanityCheck (File fp) (FileModTime old_mtime) = sanityCheck fp old_mtime
-     -- TODO: how to deal with apparently non-exhaustive patterns like this one?
+    sanityCheck (LeftName n1) (LeftEntry e1) = sanityCheck n1 e1
+    sanityCheck (RightName n2) (RightEntry e2) = sanityCheck n2 e2
+    sanityCheck _ _ = return $ Just "Mismatched name/entry structure"
     
-    defaultRule (OracleQuestion _) = return Nothing -- No default way to answer oracle questions
-    defaultRule (File fp) = liftRule defaultRule (File fp)
+    defaultRule (LeftName n1) = liftLeftRule defaultRule (LeftName n1)
+    defaultRule (RightName n2) = liftRightRule defaultRule (RightName n2)
 
 
 -- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
@@ -251,15 +258,22 @@ want = act . need
 
 
 
-liftRule :: Core.Rule' ntop CanonicalFilePath -> Core.Rule' ntop (ShakeName o)
-liftRule _    (OracleQuestion _) = return Nothing
-liftRule rule (File fp) = liftM (fmap f) $ rule fp
+liftLeftRule :: forall ntop n1 n2. Core.Rule' ntop n1 -> Core.Rule' ntop (UnionName n1 n2)
+liftLeftRule _    (RightName _) = return Nothing
+liftLeftRule rule (LeftName n2) = liftM (fmap f) $ rule n2
   where
-    f :: Generator' ntop CanonicalFilePath -> Generator' ntop (ShakeName o)
-    f (creates, act) = (map File creates, liftM (map FileModTime) act)
+    f :: Generator' ntop n1 -> Generator' ntop (UnionName n1 n2)
+    f (creates, act) = (map LeftName creates, liftM (map LeftEntry) act)
+
+liftRightRule :: forall ntop n1 n2. Core.Rule' ntop n2 -> Core.Rule' ntop (UnionName n1 n2)
+liftRightRule _    (LeftName _) = return Nothing
+liftRightRule rule (RightName n2) = liftM (fmap f) $ rule n2
+  where
+    f :: Generator' ntop n2 -> Generator' ntop (UnionName n1 n2)
+    f (creates, act) = (map RightName creates, liftM (map RightEntry) act)
 
 addRule :: Rule o -> Shake (ShakeName o) ()
-addRule rule = Core.addRule $ liftRule $ \fp -> do
+addRule rule = Core.addRule $ liftRightRule $ \fp -> do
     cwd <- getCurrentDirectory
     flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
         creates <- mapM (canonical . (cwd </>)) creates
@@ -269,18 +283,15 @@ getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
 need :: Oracle o => [FilePath] -> Act (ShakeName o) ()
-need fps = liftIO (mapM (liftM File . canonical) fps) >>= \fps -> Core.need fps >> return ()
+need fps = liftIO (mapM (liftM RightName . canonical) fps) >>= \fps -> Core.need fps >> return ()
 
 
 installOracle :: Oracle o => o -> Shake (ShakeName o) ()
-installOracle o = Core.addRule go
-  where
-    go (File _) = return Nothing
-    go (OracleQuestion q) = return $ Just ([OracleQuestion q], fmap (return . OracleAnswer) $ liftIO $ queryOracle o q)
+installOracle o = Core.addRule $ liftLeftRule $ \q -> return $ Just ([q], fmap return $ liftIO $ queryOracle o q)
 
 query :: Oracle o => Question o -> Act (ShakeName o) (Answer o)
 query q = do
-    [OracleAnswer a] <- Core.need [OracleQuestion q]
+    [LeftEntry a] <- Core.need [LeftName q]
     return a
 
 
