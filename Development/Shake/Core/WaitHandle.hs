@@ -1,5 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-module Development.Shake.WaitHandle (
+module Development.Shake.Core.WaitHandle (
     WaitHandle, newWaitHandle, waitOnWaitHandle, mayWaitOnWaitHandle, awakeWaiters
   ) where
 

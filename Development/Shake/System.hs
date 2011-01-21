@@ -5,7 +5,7 @@ module Development.Shake.System (
   ) where
 
 import Development.Shake
-import qualified Development.Shake.Utilities as Utilities
+import qualified Development.Shake.Core.Utilities as Utilities
 
 import Control.Monad.IO.Class
 
@@ -41,9 +41,10 @@ systemStdout prog = do
     reportCommand cmd $ Utilities.systemStdout cmd
   where cmd = intercalate " " prog
 
-control_characters, meta_characters :: [Char]
+control_characters :: [Char]
 control_characters = ['$', '`']
-meta_characters = [' ', '\t', '|', '&', ';', '(', ')', '<', '>']
+--meta_characters :: [Char]
+--meta_characters = [' ', '\t', '|', '&', ';', '(', ')', '<', '>']
 
 -- | Shell escaping by double-quoting the argument.
 --
@@ -54,14 +55,16 @@ quote x = "\"" ++ concatMap escape x ++ "\""
         escape c | c `elem` must_escape = ['\\', c]
                  | otherwise            = [c]
 
--- | Shell escaping by backslash-encoding the argument.
---
--- See 3.1.2.1 of <http://www.gnu.org/software/bash/manual/bashref.html#Definitions>
-escape :: String -> String
-escape x = concatMap escape x
-  where must_escape = control_characters ++ meta_characters ++ ['\\', '\'', '\"']
-        escape c | c `elem` must_escape = ['\\', c] -- TODO: I'm not using this at the moment
-                 | otherwise            = [c]
+-- TODO: I'm not using this at the moment
+-- 
+-- -- | Shell escaping by backslash-encoding the argument.
+-- --
+-- -- See 3.1.2.1 of <http://www.gnu.org/software/bash/manual/bashref.html#Definitions>
+-- escape :: String -> String
+-- escape x = concatMap escape x
+--   where must_escape = control_characters ++ meta_characters ++ ['\\', '\'', '\"']
+--         escape c | c `elem` must_escape = ['\\', c]
+--                  | otherwise            = [c]
 
 readFileLines :: FilePath -> Act CanonicalFilePath o [String] -- TODO: more polymorphism
 readFileLines x = do

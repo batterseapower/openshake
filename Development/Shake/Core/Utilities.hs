@@ -1,5 +1,5 @@
 {-# LANGUAGE Rank2Types #-}
-module Development.Shake.Utilities where
+module Development.Shake.Core.Utilities where
 
 import qualified Control.Exception as Exception
 
@@ -16,6 +16,20 @@ import System.FilePath
 import System.IO.Error (isDoesNotExistError)
 import System.IO.Temp
 
+
+uncurry3 :: (a -> b -> c -> d)
+         -> (a, b, c) -> d
+uncurry3 f (a, b, c) = f a b c
+
+snocView :: [a] -> Maybe ([a], a)
+snocView [] = Nothing
+snocView ss = Just (init ss, last ss)
+
+showStringList :: [String] -> String
+showStringList ss = case snocView ss of
+    Nothing       -> ""
+    Just ([],  s) -> s
+    Just (ss', s) -> intercalate ", " ss' ++ " and " ++ s
 
 handleDoesNotExist :: IO a -> IO a -> IO a
 handleDoesNotExist = handleIf isDoesNotExistError
@@ -77,6 +91,15 @@ mapAccumLM f = go []
         go ys acc (x:xs) = do
             (acc', y) <- f acc x
             go (y:ys) acc' xs
+
+mapMaybeM :: Monad m => (a -> m (Maybe b)) -> [a] -> m [b]
+mapMaybeM f = go
+  where go []     = return []
+        go (x:xs) = do
+          mb_y <- f x
+          case mb_y of
+            Nothing ->             go xs
+            Just y  -> liftM (y:) (go xs)
 
 (?) :: Bool -> (a, a) -> a
 True  ? (t, _) = t
