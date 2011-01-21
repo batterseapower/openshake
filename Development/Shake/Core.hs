@@ -4,25 +4,22 @@
 module Development.Shake.Core (
     -- * The top-level monadic interface
     Shake, shake,
-    addRule, act, oracle, modifyOracle,
+    addRule, act,
 
     -- * Rules
-    SomeRule, Generator, GeneratorAct(..),
+    SomeRule, Generator,
     
     -- * Verbosity and command-line output from Shake
     Verbosity(..), actVerbosity, putStrLnAt,
     
     -- * The monadic interface used by rule bodies
-    Act, need, query,
+    Act, need,
     
     -- * Namespaces
     Namespace(..),
     
-    -- * Oracles, the default oracle and wrappers for the questions it can answer
-    Oracle(..), StringOracle(..), defaultOracle, stringOracle, queryStringOracle, ls,
-    
     -- * Specialised errors
-    shakefileError,
+    shakefileError, internalError,
     
     -- * Used to add commands to the shake report
     reportCommand
@@ -36,8 +33,6 @@ import Data.Binary
 import Data.Binary.Get
 import Data.Binary.Put
 import qualified Data.ByteString.Lazy as BS
-
-import Data.Typeable
 
 import Control.Applicative (Applicative)
 import Control.Arrow (first, second)
@@ -63,9 +58,7 @@ import Data.Ord
 import Data.List
 import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
 
-import System.Directory
 import System.Environment
-import System.FilePath.Glob
 
 import GHC.Conc (numCapabilities)
 
@@ -115,47 +108,27 @@ class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), 
 
 type SomeRule n = n -> IO (Maybe (Generator n))
 
-type Generator n = ([n], GeneratorAct n [Entry n])
-data GeneratorAct n a = forall o. Oracle o => GeneratorAct o (Act n o a)
+type Generator n = ([n], Act n [Entry n])
 
 data ShakeState n = SS {
     ss_rules :: [SomeRule n],
-    ss_acts :: [GeneratorAct n ()]
+    ss_acts :: [Act n ()]
   }
 
-data ShakeEnv n o = SE {
-    se_oracle :: o
-  }
+newtype Shake n a = Shake { unShake :: State.State (ShakeState n) a }
+                  deriving (Functor, Applicative, Monad)
 
-instance Functor (ShakeEnv n) where
-    fmap f se = SE {
-        se_oracle = f (se_oracle se)
-      }
+runShake :: ShakeState n -> Shake n a -> (a, ShakeState n)
+runShake s mx = State.runState (unShake mx) s
 
-newtype Shake n o a = Shake { unShake :: Reader.ReaderT (ShakeEnv n o) (State.State (ShakeState n)) a }
-                    deriving (Functor, Applicative, Monad)
-
-runShake :: ShakeEnv n o -> ShakeState n -> Shake n o a -> (a, ShakeState n)
-runShake e s mx = State.runState (Reader.runReaderT (unShake mx) e) s
-
--- getShakeState :: Shake n o (ShakeState n)
+-- getShakeState :: Shake n (ShakeState n)
 -- getShakeState = Shake (lift State.get)
 
 -- putShakeState :: ShakeState -> Shake ()
 -- putShakeState s = Shake (lift (State.put s))
 
-modifyShakeState :: (ShakeState n -> ShakeState n) -> Shake n o ()
-modifyShakeState f = Shake (lift (State.modify f))
-
-askShakeEnv :: Shake n o (ShakeEnv n o)
-askShakeEnv = Shake Reader.ask
-
-localShakeEnv :: (ShakeEnv n o -> ShakeEnv n o') -> Shake n o' a -> Shake n o a
-localShakeEnv f mx = Shake (readerLocal f (unShake mx))
-
--- Reader.local has a restrictive type signature that prevents us from changing the environment type
-readerLocal :: (e -> e') -> Reader.ReaderT e' m a -> Reader.ReaderT e m a
-readerLocal f mx = Reader.ReaderT $ \e -> Reader.runReaderT mx (f e)
+modifyShakeState :: (ShakeState n -> ShakeState n) -> Shake n ()
+modifyShakeState f = Shake (State.modify f)
 
 
 type Database n = MVar (PureDatabase n)
@@ -203,41 +176,22 @@ getHistory = getList get
 putHistory :: Namespace n => History n -> Put
 putHistory = putList put
 
-data QA n = Oracle String BS.ByteString BS.ByteString
-          | Need [(n, Entry n)]
+data QA n = Need [(n, Entry n)]
 
 deriving instance Namespace n => Show (QA n)
 
 instance Namespace n => NFData (QA n) where
-    rnf (Oracle a b c) = rnf a `seq` rnf (BS.unpack b) `seq` rnf (BS.unpack c)
     rnf (Need xys) = rnf [rnf x `seq` rnf y | (x, y) <- xys]
 
 instance Namespace n => Binary (QA n) where
-    get = do
-        tag <- getWord8
-        case tag of
-          0 -> liftM3 Oracle getUTF8String getSizedByteString getSizedByteString
-          1 -> liftM Need (getList (liftM2 (,) get get))
-          _ -> internalError $ "get{QA}: unknown tag " ++ show tag
-    put (Oracle td bs_q bs_a) = putWord8 0 >> putUTF8String td >> putSizedByteString bs_q >> putSizedByteString bs_a
-    put (Need xes)            = putWord8 1 >> putList (\(fp, mtime) -> put fp >> put mtime) xes
-
-putOracle :: forall o. Oracle o
-          => Question o -> Answer o
-          -> (String, BS.ByteString, BS.ByteString)
-putOracle q a = (show (typeOf (undefined :: o)), runPut $ put q, runPut $ put a)
-
-peekOracle :: forall o. Oracle o
-           => String -> BS.ByteString -> BS.ByteString
-           -> Maybe (Question o, Answer o)
-peekOracle typerep bs_q bs_a = guard (show (typeOf (undefined :: o)) == typerep) >> return (runGetAll get bs_q, runGetAll get bs_a)
+    get = liftM Need (getList (liftM2 (,) get get))
+    put (Need xes) = putList (\(fp, mtime) -> put fp >> put mtime) xes
 
 data ActState n = AS {
     as_this_history :: History n
   }
 
-data ActEnv n o = AE {
-    ae_oracle :: o,                            -- ^ The oracle for the 'Act' to use when querying
+data ActEnv n = AE {
     ae_would_block_handles :: [WaitHandle ()], -- ^ A list of handles that would be incapable of awakening if the action were to
                                                --   block indefinitely here and now. This is used in the deadlock detector.
     ae_global_rules :: [SomeRule n],
@@ -248,23 +202,11 @@ data ActEnv n o = AE {
     ae_verbosity :: Verbosity
   }
 
-instance Functor (ActEnv n) where
-    fmap f ae = AE {
-        ae_oracle = f (ae_oracle ae),
-        ae_would_block_handles = ae_would_block_handles ae,
-        ae_global_rules = ae_global_rules ae,
-        ae_database = ae_database ae,
-        ae_wait_database = ae_wait_database ae,
-        ae_report = ae_report ae,
-        ae_pool = ae_pool ae,
-        ae_verbosity = ae_verbosity ae
-      }
 
-
-newtype Act n o a = Act { unAct :: Reader.ReaderT (ActEnv n o) (State.StateT (ActState n) IO) a }
+newtype Act n a = Act { unAct :: Reader.ReaderT (ActEnv n) (State.StateT (ActState n) IO) a }
               deriving (Functor, Applicative, Monad, MonadIO)
 
-runAct :: ActEnv n o -> ActState n -> Act n o a -> IO (a, ActState n)
+runAct :: ActEnv n -> ActState n -> Act n a -> IO (a, ActState n)
 runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
 
 -- getActState :: Act ActState
@@ -273,16 +215,16 @@ runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
 -- putActState :: ActState -> Act ()
 -- putActState s = Act (lift (State.put s))
 
-modifyActState :: (ActState n -> ActState n) -> Act n o ()
+modifyActState :: (ActState n -> ActState n) -> Act n ()
 modifyActState f = Act (lift (State.modify f))
 
-askActEnv :: Act n o (ActEnv n o)
+askActEnv :: Act n (ActEnv n)
 askActEnv = Act Reader.ask
 
-actVerbosity :: Act n o Verbosity
+actVerbosity :: Act n Verbosity
 actVerbosity = fmap ae_verbosity askActEnv
 
-putStrLnAt :: Verbosity -> String -> Act n o ()
+putStrLnAt :: Verbosity -> String -> Act n ()
 putStrLnAt at_verbosity msg = do
     verbosity <- actVerbosity
     liftIO $ when (verbosity >= at_verbosity) $ putStrLn msg
@@ -290,7 +232,7 @@ putStrLnAt at_verbosity msg = do
 
 -- NB: if you use shake in a nested way bad things will happen to parallelism
 -- TODO: make parallelism configurable?
-shake :: Namespace n => Shake n StringOracle () -> IO ()
+shake :: Namespace n => Shake n () -> IO ()
 shake mx = withPool numCapabilities $ \pool -> do
     -- TODO: when we have more command line options, use a proper command line argument parser.
     -- We should also work out whether shake should be doing argument parsing at all, given that it's
@@ -318,9 +260,9 @@ shake mx = withPool numCapabilities $ \pool -> do
     report_mvar <- emptyReportDatabase >>= newMVar
 
     -- Collect rules and wants, then execute the collected Act actions (in any order)
-    let ((), final_s) = runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_acts = [] }) mx
-    parallel_ pool $ flip map (ss_acts final_s) $ \(GeneratorAct o act) -> do
-        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = o, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
+    let ((), final_s) = runShake (SS { ss_rules = [], ss_acts = [] }) mx
+    parallel_ pool $ flip map (ss_acts final_s) $ \act -> do
+        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
         return ()
     
     -- TODO: put report under command-line control
@@ -331,106 +273,16 @@ shake mx = withPool numCapabilities $ \pool -> do
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
 
 
-class (Eq (Question o), Eq (Answer o),
-       Binary (Question o), Binary (Answer o),
-       Show (Question o), Show (Answer o),       -- Show is only required for nice debugging output
-       NFData (Question o), NFData (Answer o),   -- NFData is only required for reasonable errors when deserialization fails
-       Typeable o) => Oracle o where
-    data Question o
-    data Answer o
-    queryOracle :: o -> Question o -> IO (Answer o)
-
-
--- The empty oracle is useful as a placeholder in a few places
-instance Oracle () where
-    data Question ()
-    data Answer ()
-    queryOracle = internalError "The empty oracle was queried"
-
-instance Eq (Question ()) where
-    (==) = internalError "The empty question was compared"
-
-instance Eq (Answer ()) where
-    (==) = internalError "The empty answer was compared"
-
-instance Show (Question ()) where
-    show = internalError "The empty question was shown"
-
-instance Show (Answer ()) where
-    show = internalError "The empty answer was shown"
-
-instance Binary (Question ()) where
-    get = internalError "The empty question was got"
-    put = internalError "The empty question was put"
-
-instance Binary (Answer ()) where
-    get = internalError "The empty question was got"
-    put = internalError "The empty question was put"
-
-instance NFData (Question ()) where
-    rnf = internalError "The empty question was forced"
-
-instance NFData (Answer ()) where
-    rnf = internalError "The empty answer was forced"
-
-
-newtype StringOracle = SO ((String, String) -> IO [String])
-                     deriving (Typeable)
-
-instance Oracle StringOracle where
-    newtype Question StringOracle = SQ { unSQ :: (String, String) }
-                                  deriving (Eq, Show, NFData)
-    newtype Answer StringOracle = SA { unSA :: [String] }
-                                deriving (Eq, Show, NFData)
-    queryOracle (SO f) = fmap SA . f . unSQ
-
-instance Binary (Question StringOracle) where
-    get = fmap SQ $ liftM2 (,) getUTF8String getUTF8String
-    put (SQ (x, y)) = putUTF8String x >> putUTF8String y
-
-instance Binary (Answer StringOracle) where
-    get = fmap SA $ getList getUTF8String
-    put = putList putUTF8String . unSA
-
-
-defaultOracle :: StringOracle
-defaultOracle = SO go
-  where
-    go ("ls", what) = getCurrentDirectory >>= \cwd -> globDir1 (compile what) cwd
-    go question     = shakefileError $ "The default oracle cannot answer the question " ++ show question
-
-queryStringOracle :: (String, String) -> Act n StringOracle [String]
-queryStringOracle = fmap unSA . query . SQ
-
-stringOracle :: ((String, String) -> IO [String])
-             -> Shake n StringOracle a -> Shake n o a
-stringOracle = oracle . SO
-
-ls :: FilePath -> Act n StringOracle [FilePath]
-ls fp = queryStringOracle ("ls", fp)
-
-
 -- | Perform the specified action once we are done collecting rules in the 'Shake' monad.
 -- Just like 'want', there is no guarantee about the order in which the actions will be will be performed.
-act :: Oracle o => Act n o () -> Shake n o ()
-act what = do
-    o <- fmap se_oracle askShakeEnv
-    modifyShakeState (\s -> s { ss_acts = GeneratorAct o what : ss_acts s })
+act :: Act n () -> Shake n ()
+act what = modifyShakeState (\s -> s { ss_acts = what : ss_acts s })
 
 
-addRule :: Oracle o => (o -> SomeRule n) -> Shake n o ()
-addRule mk_rule = do
-    -- NB: we store the oracle with the rule to implement "lexical scoping" for oracles.
-    -- Basically, the oracle in effect when we run some rules action should be the oracle
-    -- lexically above at the time the rule was created. Thus, we form the "lexical closure"
-    -- of the oracle with the added rule.
-    --
-    -- Note the contrast with using the oracle from the point at which need was called to
-    -- invoke the rule, which is more akin to a dynamic scoping scheme.
-    o <- fmap se_oracle $ askShakeEnv
-    modifyShakeState $ \s -> s { ss_rules = mk_rule o : ss_rules s }
+addRule :: SomeRule n -> Shake n ()
+addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
 
-need :: Namespace n => [n] -> Act n o [Entry n]
+need :: Namespace n => [n] -> Act n [Entry n]
 need fps = do
     e <- askActEnv
     need_times <- liftIO $ need' e fps
@@ -443,21 +295,8 @@ withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -
 -- We assume that the rules do not change to include new dependencies often: this lets
 -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
 -- of the rule have not changed
-doesQARequireRerun :: (Namespace n, Oracle o) => ([n] -> IO [Entry n]) -> o -> QA n -> IO (Maybe String)
-doesQARequireRerun _ o (Oracle td bs_q bs_a) = 
-    case peekOracle td bs_q bs_a of
-        Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
-        Just (question, old_answer) -> do
-          -- The type of the question or answer (or their serialization schemes) might have changed since the last run,
-          -- so check that deserialization gives reasonable results
-          mb_deserialize_error <- (Exception.evaluate (rnf question `seq` rnf old_answer) >> return Nothing) `Exception.catch`
-                                  \(Exception.ErrorCall reason) -> return $ Just $ "question/answer unreadable (" ++ reason ++ "), assuming answer changed"
-          case mb_deserialize_error of
-            Just deserialize_error -> return $ Just deserialize_error
-            Nothing -> do
-              new_answer <- queryOracle o question
-              return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-doesQARequireRerun need _ (Need nested_fps_times) = do
+doesQARequireRerun :: Namespace n => ([n] -> IO [Entry n]) -> QA n -> IO (Maybe String)
+doesQARequireRerun need (Need nested_fps_times) = do
     let (nested_fps, nested_old_times) = unzip nested_fps_times
     -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
     -- so we recursively invoke need in order to check if we have any changes
@@ -466,7 +305,7 @@ doesQARequireRerun need _ (Need nested_fps_times) = do
         \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
 findAllRules :: Namespace n
-             => ActEnv n o
+             => ActEnv n
              -> [n]             -- ^ The files that we wish to find rules for
              -> [WaitHandle ()] -- ^ Handles that would be blocked if we blocked the thread right now
              -> PureDatabase n
@@ -498,7 +337,7 @@ findAllRules e (fp:fps) would_block_handles db = do
         Left mb_hist -> do
           -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
           -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-          findRule verbosity (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
+          findRule verbosity (ae_global_rules e) fp $ \(potential_creates_fps, potential_rule) -> do
             -- 1) Basic sanity check that the rule creates the file we actually need
             unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
 
@@ -524,7 +363,7 @@ findAllRules e (fp:fps) would_block_handles db = do
 
             (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing            -> return (db, Right "file was not in the database")
                                                                 Just (hist, mtime) -> withoutMVar (ae_database e) db $ do
-                                                                  mb_dirty_reason <- firstJustM $ map (doesQARequireRerun (need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e })) potential_o) hist
+                                                                  mb_dirty_reason <- firstJustM $ map (doesQARequireRerun (need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }))) hist
                                                                   case mb_dirty_reason of
                                                                     Just dirty_reason -> return $ Right dirty_reason
                                                                     Nothing -> do
@@ -572,7 +411,7 @@ findAllRules e (fp:fps) would_block_handles db = do
   where
     verbosity = ae_verbosity e
 
-need' :: forall n o. Namespace n => ActEnv n o -> [n] -> IO [Entry n]
+need' :: Namespace n => ActEnv n -> [n] -> IO [Entry n]
 need' e init_fps = do
     -- Figure out the rules we need to use to create all the dirty files we need
     --
@@ -693,7 +532,7 @@ reportConcurrencyBump :: Int -> MVar ReportDatabase -> IO a -> IO a
 reportConcurrencyBump bump mvar_rdb act = Exception.bracket (bump_concurrency bump) (\() -> bump_concurrency (negate bump)) (\() -> act)
   where bump_concurrency directed_bump = modifyMVar_ mvar_rdb $ \rdb -> getCurrentTime >>= \ts -> return $ rdb { rdb_concurrency = rdb_concurrency rdb + directed_bump, rdb_observed_concurrency = (ts, rdb_concurrency rdb - directed_bump) : rdb_observed_concurrency rdb }
 
-reportCommand :: String -> IO a -> Act n o a
+reportCommand :: String -> IO a -> Act n a
 reportCommand cmd act = do
     mvar_rdb <- fmap ae_report askActEnv
     liftIO $ reportCommandIO mvar_rdb cmd act
@@ -751,18 +590,18 @@ markCleans db_mvar nested_hist relevant_nested_times = modifyMVar_ db_mvar (retu
   where go init_db = foldr (\(fp, nested_time) db -> M.insert fp (Clean nested_hist nested_time) db) init_db relevant_nested_times
 
 
-appendHistory :: QA n -> Act n o ()
+appendHistory :: QA n -> Act n ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-type RuleFinder n = forall r o'. Verbosity -> [SomeRule n] -> n
-                              -> (forall o. Oracle o => (o, [n], ActEnv n o' -> (IO (History n, [Entry n]))) -> IO r)
-                              -> IO r
+type RuleFinder n = forall r. Verbosity -> [SomeRule n] -> n
+                           -> (([n], ActEnv n -> (IO (History n, [Entry n]))) -> IO r)
+                           -> IO r
 findRule :: Namespace n => RuleFinder n
 findRule verbosity rules fp k = do
     possibilities <- mapMaybeM ($ fp) rules
     -- To make sure we choose the first rule, we need to reverse the list of matches (we add them in reverse order)
-    (creates_fps, GeneratorAct o action) <- case reverse possibilities of
+    (creates_fps, action) <- case reverse possibilities of
       generator:other_matches -> do
           unless (null other_matches) $
             when (verbosity > NormalVerbosity) $
@@ -774,19 +613,6 @@ findRule verbosity rules fp k = do
             Nothing        -> shakefileError $ "No rule to build " ++ show fp
             Just generator -> return generator
 
-    k (o, creates_fps, \e -> do
-        (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
+    k (creates_fps, \e -> do
+        (creates_times, final_nested_s) <- runAct e (AS { as_this_history = [] }) action
         return (as_this_history final_nested_s, creates_times))
-
-oracle :: o' -> Shake n o' a -> Shake n o a
-oracle o' = modifyOracle (const o')
-
-modifyOracle :: (o -> o') -> Shake n o' a -> Shake n o a
-modifyOracle mk_o = localShakeEnv (\e -> e { se_oracle = mk_o (se_oracle e) })
-
-query :: Oracle o => Question o -> Act n o (Answer o)
-query question = do
-    e <- askActEnv
-    answer <- liftIO $ queryOracle (ae_oracle e) question
-    appendHistory $ uncurry3 Oracle $ putOracle question answer
-    return answer
