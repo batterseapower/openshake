@@ -5,13 +5,13 @@ module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
     Rule, CreatesFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
-    want, oracle, modifyOracle,
-    
-    -- * Namespaces
-    FileName,
+    want, act, oracle, modifyOracle,
     
     -- * Verbosity and command-line output from Shake
     Verbosity(..), actVerbosity, putStrLnAt,
+    
+    -- * Namespaces
+    CanonicalFilePath,
     
     -- * The monadic interface used by rule bodies
     Act, need, query,
@@ -56,9 +56,11 @@ import Data.Maybe
 import Data.Ord
 import Data.List
 import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
+import Data.Traversable (Traversable(traverse))
 
 import System.Directory
 import System.Environment
+import System.FilePath (equalFilePath, makeRelative, (</>))
 import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
@@ -122,80 +124,36 @@ class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), 
     defaultRule _ = return Nothing
 
 
-newtype FileName = FN { unFN :: FilePath }
-                 deriving (Eq, Ord, NFData)
-
-instance Show FileName where
-    show = unFN -- TODO: confirm that Show is only used in errors, and use Pretty instead?
-
-instance Binary FileName where
-    get = fmap FN getUTF8String
-    put = putUTF8String . unFN
-
-instance Namespace FileName where
-    type Entry FileName = ModTime
-    -- In standard Shake, we would:
-    --   * Not sanity check anything
-    --   * Recover the ModTime by looking at the file modification time
-    --   * And hence dependent files would be rebuilt but the file would not be, even if the modification time had changed since the last run
-    --
-    -- In OpenShake, we would:
-    --   * Cache the ModTime
-    --   * Sanity check the current ModTime against the current one
-    --   * Thus we detect changes in this file since the last run, so changed files will be rebuilt even if their dependents haven't changed
-    sanityCheck (FN fp) old_mtime = getFileModTime fp >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
-    
-    defaultRule (FN fp) = do
-        -- Not having a rule might still be OK, as long as there is some existing file here:
-        mb_nested_time <- getFileModTime fp
-        case mb_nested_time of
-            Nothing          -> return Nothing
-            -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
-            -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
-            -- check will catch the change.
-            Just nested_time -> return $ Just ([FN fp], GeneratorAct () $ return [(FN fp, nested_time)]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
-
-
 type CreatesFiles = [FilePath]
 type Rule n o = FilePath -> Maybe (CreatesFiles, Act n o ())
 
-type SomeRule n = n -> Maybe (Generator n)
+type SomeRule n = n -> IO (Maybe (Generator n))
 
 type Generator n = ([n], GeneratorAct n)
 data GeneratorAct n = forall o. Oracle o => GeneratorAct o (Act n o [(n, Entry n)])
 
 data ShakeState n = SS {
-    ss_rules :: [SomeRule n]
+    ss_rules :: [SomeRule n],
+    ss_acts :: [GeneratorAct n]
   }
 
 data ShakeEnv n o = SE {
-    se_database :: Database n,
-    se_wait_database :: MVar (WaitDatabase n),
-    se_report :: MVar ReportDatabase,
-    se_pool :: Pool,
-    se_oracle :: o,
-    se_verbosity :: Verbosity
+    se_oracle :: o
   }
 
 instance Functor (ShakeEnv n) where
     fmap f se = SE {
-        se_database = se_database se,
-        se_wait_database = se_wait_database se,
-        se_report = se_report se,
-        se_pool = se_pool se,
-        se_oracle = f (se_oracle se),
-        se_verbosity = se_verbosity se
+        se_oracle = f (se_oracle se)
       }
 
--- TODO: should Shake really be an IO monad?
-newtype Shake n o a = Shake { unShake :: Reader.ReaderT (ShakeEnv n o) (State.StateT (ShakeState n) IO) a }
-                  deriving (Functor, Applicative, Monad, MonadIO)
+newtype Shake n o a = Shake { unShake :: Reader.ReaderT (ShakeEnv n o) (State.State (ShakeState n)) a }
+                    deriving (Functor, Applicative, Monad)
 
-runShake :: ShakeEnv n o -> ShakeState n -> Shake n o a -> IO (a, ShakeState n)
-runShake e s mx = State.runStateT (Reader.runReaderT (unShake mx) e) s
+runShake :: ShakeEnv n o -> ShakeState n -> Shake n o a -> (a, ShakeState n)
+runShake e s mx = State.runState (Reader.runReaderT (unShake mx) e) s
 
-getShakeState :: Shake n o (ShakeState n)
-getShakeState = Shake (lift State.get)
+-- getShakeState :: Shake n o (ShakeState n)
+-- getShakeState = Shake (lift State.get)
 
 -- putShakeState :: ShakeState -> Shake ()
 -- putShakeState s = Shake (lift (State.put s))
@@ -238,6 +196,51 @@ getFileModTime :: FilePath -> IO (Maybe ModTime)
 getFileModTime fp = handleDoesNotExist (return Nothing) (fmap Just (getModificationTime fp))
 
 
+newtype CanonicalFilePath = UnsafeCanonicalise { filePath :: FilePath }
+                          deriving (Ord, NFData)
+
+instance Show CanonicalFilePath where
+    show = filePath -- TODO: confirm that Show is only used in errors, and use Pretty instead?
+
+instance Eq CanonicalFilePath where
+    cfp1 == cfp2 = filePath cfp1 `equalFilePath` filePath cfp2
+
+instance Binary CanonicalFilePath where
+    get = fmap UnsafeCanonicalise getUTF8String
+    put = putUTF8String . filePath
+
+instance Namespace CanonicalFilePath where
+    type Entry CanonicalFilePath = ModTime
+    -- In standard Shake, we would:
+    --   * Not sanity check anything
+    --   * Recover the ModTime by looking at the file modification time
+    --   * And hence dependent files would be rebuilt but the file would not be, even if the modification time had changed since the last run
+    --
+    -- In OpenShake, we would:
+    --   * Cache the ModTime
+    --   * Sanity check the current ModTime against the current one
+    --   * Thus we detect changes in this file since the last run, so changed files will be rebuilt even if their dependents haven't changed
+    sanityCheck fp old_mtime = getFileModTime (filePath fp) >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
+
+    defaultRule fp = do
+        -- Not having a rule might still be OK, as long as there is some existing file here:
+        mb_nested_time <- getFileModTime (filePath fp)
+        case mb_nested_time of
+            Nothing          -> return Nothing
+            -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
+            -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
+            -- check will catch the change.
+            Just nested_time -> return $ Just ([fp], GeneratorAct () $ return [(fp, nested_time)]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+
+
+canonical :: FilePath -> IO CanonicalFilePath
+canonical fp = do
+    exists <- doesFileExist fp
+    if exists
+      then fmap UnsafeCanonicalise $ canonicalizePath fp
+      else fmap (UnsafeCanonicalise . (</> fp)) getCurrentDirectory
+
+
 type Database n = MVar (PureDatabase n)
 type PureDatabase n = Map n (Status n)
 
@@ -246,6 +249,7 @@ getPureDatabase = fmap M.fromList $ getList (liftM2 (,) get (liftM2 Dirty getHis
 
 putPureDatabase :: Namespace n => PureDatabase n -> Put
 putPureDatabase db = putList (\(fp, (hist, cached)) -> put fp >> putHistory hist >> put cached) (M.toList $ M.mapMaybe prepareStatus db)
+
 
 -- NB: we seralize Building as Dirty in case we ever want to serialize the database concurrently
 -- with shake actually running. This might be useful to implement e.g. checkpointing...
@@ -343,21 +347,27 @@ data ActState n = AS {
   }
 
 data ActEnv n o = AE {
-    ae_oracle :: o, -- ^ The oracle for the 'Act' to use when querying. Note that we should not (and cannot, thanks to
-                    --   the type system) access the oracle from the 'ShakeEnv', because that is the "dynamically scoped" one
-                    --   that just happens to be in scope at the time we "need" a file, not the one in scope when the rule was created.
+    ae_oracle :: o,                                   -- ^ The oracle for the 'Act' to use when querying
     ae_would_block_handles :: [BuildingWaitHandle n], -- ^ A list of handles that would be incapable of awakening if the action were to
                                                       --   block indefinitely here and now. This is used in the deadlock detector.
-    ae_global_env :: ShakeEnv n (),
-    ae_global_rules :: [SomeRule n]
+    ae_global_rules :: [SomeRule n],
+    ae_database :: Database n,
+    ae_wait_database :: MVar (WaitDatabase n),
+    ae_report :: MVar ReportDatabase,
+    ae_pool :: Pool,
+    ae_verbosity :: Verbosity
   }
 
 instance Functor (ActEnv n) where
     fmap f ae = AE {
         ae_oracle = f (ae_oracle ae),
         ae_would_block_handles = ae_would_block_handles ae,
-        ae_global_env = ae_global_env ae,
-        ae_global_rules = ae_global_rules ae
+        ae_global_rules = ae_global_rules ae,
+        ae_database = ae_database ae,
+        ae_wait_database = ae_wait_database ae,
+        ae_report = ae_report ae,
+        ae_pool = ae_pool ae,
+        ae_verbosity = ae_verbosity ae
       }
 
 
@@ -380,7 +390,7 @@ askActEnv :: Act n o (ActEnv n o)
 askActEnv = Act Reader.ask
 
 actVerbosity :: Act n o Verbosity
-actVerbosity = fmap (se_verbosity . ae_global_env) askActEnv 
+actVerbosity = fmap ae_verbosity askActEnv
 
 putStrLnAt :: Verbosity -> String -> Act n o ()
 putStrLnAt at_verbosity msg = do
@@ -416,8 +426,12 @@ shake mx = withPool numCapabilities $ \pool -> do
     
     wdb_mvar <- newMVar emptyWaitDatabase
     report_mvar <- emptyReportDatabase >>= newMVar
-    
-    ((), _final_s) <- runShake (SE { se_database = db_mvar, se_wait_database = wdb_mvar, se_report = report_mvar, se_pool = pool, se_oracle = defaultOracle, se_verbosity = verbosity }) (SS { ss_rules = [] }) mx
+
+    -- Collect rules and wants, then execute the collected Act actions (in any order)
+    let ((), final_s) = runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_acts = [] }) mx
+    parallel_ pool $ flip map (ss_acts final_s) $ \(GeneratorAct o act) -> do
+        (_time, _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = o, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
+        return ()
     
     -- TODO: put report under command-line control
     final_report <- takeMVar report_mvar
@@ -492,9 +506,7 @@ instance Binary (Answer StringOracle) where
 defaultOracle :: StringOracle
 defaultOracle = SO go
   where
-    -- Doesn't work because we want to do things like "ls *.c", and since the shell does globbing we need to go through it
-    --go ("ls", fp) = unsafePerformIO $ getDirectoryContents fp 
-    go ("ls", what) = fmap lines $ systemStdout' ("ls " ++ what)
+    go ("ls", what) = getCurrentDirectory >>= \cwd -> globDir1 (compile what) cwd
     go question     = shakefileError $ "The default oracle cannot answer the question " ++ show question
 
 queryStringOracle :: (String, String) -> Act n StringOracle [String]
@@ -508,46 +520,50 @@ ls :: FilePath -> Act n StringOracle [FilePath]
 ls fp = queryStringOracle ("ls", fp)
 
 
--- TODO: Neil's example from his presentation only works if want doesn't actually build anything until the end (he wants before setting up any rules)
-want :: [FilePath] -> Shake FileName o ()
-want = want' . map FN
+-- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
+-- There is no guarantee about the order in which files will be built: in particular, files mentioned in one
+-- 'want' will not necessarily be built before we begin building files in the following 'want'.
+want :: (Namespace n, Oracle o) => [n] -> Shake n o ()
+want = act . need'
 
-want' :: Namespace n => [n] -> Shake n o ()
-want' fps = do
-    e <- askShakeEnv
-    s <- getShakeState
-    (_time, _final_s) <- liftIO $ runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules s, ae_global_env = fmap (const ()) e, ae_oracle = () }) (AS { as_this_history = [] }) (need' fps)
-    return ()
+-- | Perform the specified action once we are done collecting rules in the 'Shake' monad.
+-- Just like 'want', there is no guarantee about the order in which the actions will be will be performed.
+act :: Oracle o => Act n o [(n, Entry n)] -> Shake n o ()
+act what = do
+    o <- fmap se_oracle askShakeEnv
+    modifyShakeState (\s -> s { ss_acts = GeneratorAct o what : ss_acts s })
 
-(*>) :: Oracle o => String -> (FilePath -> Act FileName o ()) -> Shake FileName o ()
+
+(*>) :: Oracle o => String -> (FilePath -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
 (*>) pattern action = (compiled `match`) ?> action
   where compiled = compile pattern
 
-(*@>) :: Oracle o => (String, CreatesFiles) -> (FilePath -> Act FileName o ()) -> Shake FileName o ()
+(*@>) :: Oracle o => (String, CreatesFiles) -> (FilePath -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
 (*@>) (pattern, alsos) action = (\fp -> guard (compiled `match` fp) >> return alsos) ?@> action
   where compiled = compile pattern
 
-(**>) :: Oracle o => (FilePath -> Maybe a) -> (FilePath -> a -> Act FileName o ()) -> Shake FileName o ()
+(**>) :: Oracle o => (FilePath -> Maybe a) -> (FilePath -> a -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
 (**>) p action = addRule $ \fp -> p fp >>= \x -> return ([fp], action fp x)
 
-(**@>) :: Oracle o => (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act FileName o ()) -> Shake FileName o ()
+(**@>) :: Oracle o => (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
 (**@>) p action = addRule $ \fp -> p fp >>= \(creates, x) -> return (creates, action fp x)
 
-(?>) :: Oracle o => (FilePath -> Bool) -> (FilePath -> Act FileName o ()) -> Shake FileName o ()
+(?>) :: Oracle o => (FilePath -> Bool) -> (FilePath -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
 (?>) p action = addRule $ \fp -> guard (p fp) >> return ([fp], action fp)
 
-(?@>) :: Oracle o => (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act FileName o ()) -> Shake FileName o ()
+(?@>) :: Oracle o => (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
 (?@>) p action = addRule $ \fp -> p fp >>= \creates -> return (creates, action fp)
 
 
-addRule :: Oracle o => Rule FileName o -> Shake FileName o ()
-addRule rule = addRule' (\o -> fmap (generator_act o) . rule . unFN)
-  where
-    generator_act :: Oracle o => o -> (CreatesFiles, Act FileName o ()) -> Generator FileName
-    generator_act o (creates_fps, act) = (,) (map FN creates_fps) $ GeneratorAct o $ act >> mapM (\fp -> fmap ((,) (FN fp)) (liftIO $ getCleanFileModTime fp)) creates_fps
+addRule :: Oracle o => Rule CanonicalFilePath o -> Shake CanonicalFilePath o ()
+addRule rule = addRule' $ \o fp -> do
+    cwd <- getCurrentDirectory
+    flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
+        creates <- mapM (canonical . (cwd </>)) creates
+        return (creates, GeneratorAct o $ act >> mapM (\fp -> fmap ((,) fp) (liftIO $ getCleanFileModTime (filePath fp))) creates)
 
 addRule' :: Oracle o => (o -> SomeRule n) -> Shake n o ()
-addRule' rule = do
+addRule' mk_rule = do
     -- NB: we store the oracle with the rule to implement "lexical scoping" for oracles.
     -- Basically, the oracle in effect when we run some rules action should be the oracle
     -- lexically above at the time the rule was created. Thus, we form the "lexical closure"
@@ -556,29 +572,30 @@ addRule' rule = do
     -- Note the contrast with using the oracle from the point at which need was called to
     -- invoke the rule, which is more akin to a dynamic scoping scheme.
     o <- fmap se_oracle $ askShakeEnv
-    modifyShakeState $ \s -> s { ss_rules = rule o : ss_rules s }
+    modifyShakeState $ \s -> s { ss_rules = mk_rule o : ss_rules s }
 
 getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
-need :: [FilePath] -> Act FileName o ()
-need = need' . map FN
+need :: [FilePath] -> Act CanonicalFilePath o ()
+need fps = liftIO (mapM canonical fps) >>= \fps -> need' fps >> return ()
 
-need' :: Namespace n => [n] -> Act n o ()
+need' :: Namespace n => [n] -> Act n o [(n, Entry n)]
 need' fps = do
     e <- askActEnv
     need_times <- liftIO $ need'' e fps
-    appendHistory $ Need $ need_times
+    appendHistory $ Need need_times
+    return need_times
 
 withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
 withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -> return (x', y)
 
 need'' :: forall n o. Namespace n => ActEnv n o -> [n] -> IO [(n, Entry n)]
 need'' e init_fps = do
-    let verbosity = se_verbosity (ae_global_env e)
-        db_mvar = se_database (ae_global_env e)
-
-    let -- We assume that the rules do not change to include new dependencies often: this lets
+    let verbosity = ae_verbosity e
+        db_mvar = ae_database e
+        
+        -- We assume that the rules do not change to include new dependencies often: this lets
         -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
         -- of the rule have not changed
         history_requires_rerun :: forall o'. Oracle o' => [BuildingWaitHandle n] -> o' -> QA n -> IO (Maybe String)
@@ -624,13 +641,12 @@ need'' e init_fps = do
                   Just (Dirty hist mtime)     -> Left (Just (hist, mtime))
                   Just (Clean _ mtime)        -> Right (Left mtime)
                   Just (Building _ wait_mvar) -> Right (Right wait_mvar)
-            
             case ei_unclean_clean of
                 Right ei_mtime_wait_handle -> find_all_rules ((fp, ei_mtime_wait_handle) : pending_cleans) pending_uncleans fps would_block_handles db
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-                  findRule (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
+                  findRule verbosity (ae_global_rules e) fp $ \(potential_o, potential_creates_fps, potential_rule) -> do
                     -- 1) Basic sanity check that the rule creates the file we actually need
                     unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
     
@@ -685,7 +701,7 @@ need'' e init_fps = do
                         rule = do
                             (nested_hist, mtimes) <- basic_rule
                             -- This is where we mark all of the files created by the rule as Clean:
-                            markCleans (se_database (ae_global_env e)) nested_hist creates_fps mtimes
+                            markCleans (ae_database e) nested_hist creates_fps mtimes
                             -- Wake up all of the waiters on the old Building entry (if any)
                             awakeWaiters wait_handle mtimes
                             return mtimes
@@ -702,29 +718,30 @@ need'' e init_fps = do
     -- When we have to recursively invoke need, we put back into the MVar before doing so.
     (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps []
     
-    let no_mtime_error fp = internalError $ "A rule should have reported the modification time for the file " ++ show fp
+    let no_mtime_error :: Show n => n -> r
+        no_mtime_error fp = internalError $ "A rule should have reported the modification time for the file " ++ show fp
     
     -- Run the rules we have decided upon in parallel
     --
     -- NB: we report that the thread using parallel is blocked because it may go on to actually
     -- execute one of the parallel actions, which will bump the parallelism count without any
     -- extra parallelism actually occuring.
-    unclean_times <- fmap concat $ reportWorkerBlocked (se_report (ae_global_env e)) $ parallel (se_pool (ae_global_env e)) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (se_report (ae_global_env e)) $ do
+    unclean_times <- fmap concat $ reportWorkerBlocked (ae_report e) $ parallel (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
         return $ snd $ lookupMany no_mtime_error unclean_fps mtimes
-    
+
     -- NB: we communicate the ModTimes of files that we were waiting on the completion of via the BuildingWaitHandle
     clean_times <- forM cleans $ \(clean_fp, ei_mtime_wait_handle) -> fmap ((,) clean_fp) $ case ei_mtime_wait_handle of
           Left mtime -> return mtime
           Right wait_handle -> do
             -- We can avoid a lot of fuss if the wait handle is already triggered so there can be no waiting...
             may_wait <- mayWaitOnWaitHandle wait_handle
-            let wrapper | not may_wait = id
-                        | otherwise = reportWorkerBlocked (se_report (ae_global_env e)) .
-                                      registerWait (se_wait_database (ae_global_env e)) clean_fp wait_handle (ae_would_block_handles e) .
-                                      extraWorkerWhileBlocked (se_pool (ae_global_env e)) -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+            let wrapper | may_wait  = reportWorkerBlocked (ae_report e) .
+                                      registerWait (ae_wait_database e) clean_fp wait_handle (ae_would_block_handles e) .
+                                      extraWorkerWhileBlocked (ae_pool e) -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+                        | otherwise = id
             fmap (fromMaybe (no_mtime_error clean_fp) . lookup clean_fp) $ wrapper (waitOnWaitHandle wait_handle)
     
     return $ unclean_times ++ clean_times
@@ -734,7 +751,7 @@ type WaitNumber = Int
 
 -- | A 'WaitHandle's that cannot be awoken because the thread that
 -- would do the awaking are blocked on another 'WaitHandle'. With each blocked 'WaitHandle'
--- we record the reason that we did the blocking in the first place in the form of a 'FilePath'.
+-- we record the reason that we did the blocking in the first place in the form of a 'String'.
 --
 -- We record a 'WaitNumber' with each entry so that we can unregister a wait that we previously
 -- added without interfering with information that has been added in the interim.
@@ -830,7 +847,7 @@ reportConcurrencyBump bump mvar_rdb act = Exception.bracket (bump_concurrency bu
 
 reportCommand :: String -> IO a -> Act n o a
 reportCommand cmd act = do
-    mvar_rdb <- fmap (se_report . ae_global_env) askActEnv
+    mvar_rdb <- fmap ae_report askActEnv
     liftIO $ reportCommandIO mvar_rdb cmd act
 
 reportCommandIO :: MVar ReportDatabase -> String -> IO a -> IO a
@@ -891,24 +908,38 @@ markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . 
 appendHistory :: QA n -> Act n o ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
+mapMaybeM :: Monad m => (a -> m (Maybe b)) -> [a] -> m [b]
+mapMaybeM f = go
+  where go []     = return []
+        go (x:xs) = do
+          mb_y <- f x
+          case mb_y of
+            Nothing ->             go xs
+            Just y  -> liftM (y:) (go xs)
+
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-type RuleFinder n = forall r o'. [SomeRule n] -> n
+type RuleFinder n = forall r o'. Verbosity -> [SomeRule n] -> n
                               -> (forall o. Oracle o => (o, [n], ActEnv n o' -> (IO (History n, [(n, Entry n)]))) -> IO r)
                               -> IO r
 findRule :: Namespace n => RuleFinder n
-findRule rules fp k = do
-  (creates_fps, GeneratorAct o action) <- case [(creates_fps, action) | rule <- rules, Just (creates_fps, action) <- [rule fp]] of
-    [generator] -> return generator
-    [] -> do
-      mb_generator <- defaultRule fp
-      case mb_generator of
-        Nothing        -> shakefileError $ "No rule to build " ++ show fp
-        Just generator -> return generator
-    _generators -> shakefileError $ "Ambiguous rules for " ++ show fp -- TODO: disambiguate with a heuristic based on specificity of match/order in which rules were added?
-  
-  k (o, creates_fps, \e -> do
-      (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
-      return (as_this_history final_nested_s, creates_times))
+findRule verbosity rules fp k = do
+    possibilities <- mapMaybeM ($ fp) rules
+    -- To make sure we choose the first rule, we need to reverse the list of matches (we add them in reverse order)
+    (creates_fps, GeneratorAct o action) <- case reverse possibilities of
+      generator:other_matches -> do
+          unless (null other_matches) $
+            when (verbosity > NormalVerbosity) $
+              putStrLn $ "Ambiguous rules for " ++ show fp ++ ": choosing the first one"
+          return generator
+      [] -> do
+          mb_generator <- defaultRule fp
+          case mb_generator of
+            Nothing        -> shakefileError $ "No rule to build " ++ show fp
+            Just generator -> return generator
+
+    k (o, creates_fps, \e -> do
+        (creates_times, final_nested_s) <- runAct (fmap (const o) e) (AS { as_this_history = [] }) action
+        return (as_this_history final_nested_s, creates_times))
 
 oracle :: o' -> Shake n o' a -> Shake n o a
 oracle o' = modifyOracle (const o')

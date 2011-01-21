@@ -1,5 +1,5 @@
 module Development.Shake.C(
-    cIncludes
+    cppIncludes
   ) where
 
 import Development.Shake
@@ -11,9 +11,10 @@ import Data.Char
 import Data.List
 import Data.Maybe
 
+import System.FilePath
 
-cIncludes :: FilePath -> Act FileName o [FilePath] -- TODO: more polymorphism
-cIncludes fp = fmap (mapMaybe takeInclude) $ readFileLines fp
+cppIncludes :: FilePath -> Act CanonicalFilePath o [FilePath] -- TODO: more polymorphism
+cppIncludes fp = fmap (map (takeDirectory fp </>) . mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack
     -- FIXME: transitive dependencies
