@@ -40,6 +40,7 @@ import qualified Data.ByteString.Lazy as BS
 import Data.Typeable
 
 import Control.Applicative (Applicative)
+import Control.Arrow (first, second)
 
 import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
@@ -469,25 +470,14 @@ need' e init_fps = do
     let verbosity = ae_verbosity e
         db_mvar = ae_database e
     
-        find_all_rules :: [(n, IO (Entry n))]        -- ^ Clean: file is either built or being built elsewhere. Just wait for it.
-                       -> [([n], [n], IO [Entry n])] -- ^ Unclean: we must build them. Triple of (files we asked for, files rule creates, rule action for the created stuff)
-                       -> [n]                        -- ^ We are still not sure about these files
-                       -> [WaitHandle ()]            -- ^ Handles that would be blocked if we blocked the thread right now
+        find_all_rules :: [n]             -- ^ The files that we wish to find rules for
+                       -> [WaitHandle ()] -- ^ Handles that would be blocked if we blocked the thread right now
                        -> PureDatabase n
                        -> IO (PureDatabase n,
-                              ([(n, IO (Entry n))],
-                               [([n], IO [Entry n])])) -- Unclean. Pair of (files we asked for, rules action for the *asked for* stuff)
-        find_all_rules pending_cleans pending_uncleans [] _ db = do
-            -- Display a helpful message to the user explaining the rules that we have decided upon:
-            let all_creates_fps = [creates_fp | (_, creates_fps, _) <- pending_uncleans, creates_fp <- creates_fps]
-            when (not (null pending_uncleans) && verbosity >= ChattyVerbosity) $
-                putStrLn $ "Using " ++ show (length pending_uncleans) ++ " rule instances to create the " ++
-                           show (length all_creates_fps) ++ " files (" ++ showStringList (map show all_creates_fps) ++ ")"
-            
-            -- The rule-running code doesn't need to know *all* the files created by a rule run
-            return (db, (pending_cleans, [ (unclean_fps, fmap (\creates_times -> fromRight (\fp -> internalError $ "A pending unclean rule did not create the file " ++ show fp ++ " that we thought it did") $ lookupMany unclean_fps (creates_fps `zip` creates_times)) rule)
-                                         | (unclean_fps, creates_fps, rule) <- pending_uncleans]))
-        find_all_rules pending_cleans pending_uncleans (fp:fps) would_block_handles db = do
+                              ([(n, IO (Entry n))],    -- Action that just waits for a build in progress elsewhere to complete
+                               [([n], IO [Entry n])])) -- Action that creates (possibly several) of the files we asked for by invoking a user rule
+        find_all_rules []       _                   db = return (db, ([], []))
+        find_all_rules (fp:fps) would_block_handles db = do
             let ei_unclean_clean = case M.lookup fp db of
                   Nothing                     -> Left Nothing
                   Just (Dirty hist mtime)     -> Left (Just (hist, mtime))
@@ -505,7 +495,7 @@ need' e init_fps = do
                     -- NB: we communicate the ModTimes of files that we were waiting on the completion of via the BuildingWaitHandle
                     wrapper (waitOnWaitHandle wait_mvar)
             case ei_unclean_clean of
-                Right clean_act -> find_all_rules ((fp, clean_act) : pending_cleans) pending_uncleans fps would_block_handles db
+                Right clean_act -> fmap (second (first ((fp, clean_act) :))) $ find_all_rules fps would_block_handles db
                 Left mb_hist -> do
                   -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
                   -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
@@ -561,26 +551,35 @@ need' e init_fps = do
                           Nothing                        -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
                           Just (clean_hist, clean_mtime) -> ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
                       
+                        -- It is possible that we need two different files that are both created by the same rule. This is not an error!
+                        -- What we should do is remove from the remaning uncleans any files that are created by the rule we just added
+                        (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
+                        all_fps_satisfied_here = fp : next_fps_satisifed_here
+                      
                         -- Augment the rule so that when it is run it sets all of the things it built to Clean again
+                        -- We also trim down the set of Entries it returns so that we only get entries for the *things
+                        -- we asked for*, not *the things the rule creates*
                         rule = do
                             (nested_hist, mtimes) <- basic_rule
                             -- This is where we mark all of the files created by the rule as Clean:
                             markCleans (ae_database e) nested_hist (creates_fps `zip` mtimes)
                             -- Wake up all of the waiters on the old Building entry (if any)
                             awake_waiters mtimes
-                            return mtimes
+                            -- Trim unnecessary modification times before we continue
+                            return $ fromRight (\fp -> internalError $ "A pending unclean rule did not create the file " ++ show fp ++ " that we thought it did") $ lookupMany all_fps_satisfied_here (creates_fps `zip` mtimes)
     
-                    -- 2) It is possible that we need two different files that are both created by the same rule. This is not an error!
-                    --    What we should do is remove from the remaning uncleans any files that are created by the rule we just added
-                    let (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
-                    find_all_rules pending_cleans ((fp : next_fps_satisifed_here, creates_fps, rule) : pending_uncleans) fps' would_block_handles db
+                    -- Display a helpful message to the user explaining the rules that we have decided upon:
+                    when (verbosity >= ChattyVerbosity) $
+                        putStrLn $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show all_fps_satisfied_here)
+                    
+                    fmap (second (second ((all_fps_satisfied_here, rule) :))) $ find_all_rules fps' would_block_handles db
     
     -- Figure out the rules we need to use to create all the dirty files we need
     --
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff).
     -- When we have to recursively invoke need, we put back into the MVar before doing so.
-    (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules [] [] init_fps []
+    (cleans, uncleans) <- modifyMVar db_mvar $ find_all_rules init_fps []
     
     -- Run the rules we have decided upon in parallel
     --
