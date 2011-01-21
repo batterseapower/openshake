@@ -250,18 +250,21 @@ want = act . need
 
 
 liftLeftRule :: forall ntop n1 n2. Core.Rule' ntop n1 -> Core.Rule' ntop (UnionName n1 n2)
-liftLeftRule _    (RightName _) = return Nothing
-liftLeftRule rule (LeftName n2) = liftM (fmap f) $ rule n2
-  where
-    f :: Generator' ntop n1 -> Generator' ntop (UnionName n1 n2)
-    f (creates, act) = (map LeftName creates, liftM (map LeftEntry) act)
+liftLeftRule = liftRule (\n -> case n of RightName _ -> Nothing; LeftName n1 -> Just n1) LeftName LeftEntry
 
 liftRightRule :: forall ntop n1 n2. Core.Rule' ntop n2 -> Core.Rule' ntop (UnionName n1 n2)
-liftRightRule _    (LeftName _) = return Nothing
-liftRightRule rule (RightName n2) = liftM (fmap f) $ rule n2
-  where
-    f :: Generator' ntop n2 -> Generator' ntop (UnionName n1 n2)
-    f (creates, act) = (map RightName creates, liftM (map RightEntry) act)
+liftRightRule = liftRule (\n -> case n of LeftName _ -> Nothing; RightName n2 -> Just n2) RightName RightEntry
+
+liftRule :: forall ntop nsup nsub.
+            (nsup -> Maybe nsub)
+         -> (nsub -> nsup)
+         -> (Entry nsub -> Entry nsup)
+         -> Core.Rule' ntop nsub
+         -> Core.Rule' ntop nsup
+liftRule xtract inject_n inject_e rule ntop = case xtract ntop of
+    Nothing -> return Nothing
+    Just n -> liftM (fmap (\(creates, act) -> (map inject_n creates, liftM (map inject_e) act))) $ rule n
+
 
 addRule :: Rule o -> Shake (ShakeName o) ()
 addRule rule = Core.addRule $ liftRightRule $ \fp -> do
