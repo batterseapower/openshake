@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, DeriveDataTypeable, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -28,8 +28,6 @@ import Development.Shake.Core.Binary
 import Development.Shake.Core.Utilities
 
 import Data.Binary
-
-import Data.Typeable
 
 import Control.DeepSeq
 
@@ -95,20 +93,13 @@ canonical fp = do
       else fmap (UnsafeCanonicalise . (</> fp)) getCurrentDirectory
 
 
-class (Namespace (Question o), -- TODO: subsumes a lot of other stuff
-       Eq (Question o), Eq (Answer o),
-       Ord (Question o),
-       Binary (Question o), Binary (Answer o),
-       Show (Question o), Show (Answer o),       -- Show is only required for nice debugging output
-       NFData (Question o), NFData (Answer o),   -- NFData is only required for reasonable errors when deserialization fails
-       Typeable o) => Oracle o where
+class Namespace (Question o) => Oracle o where
     data Question o
     data Answer o
     queryOracle :: o -> Question o -> IO (Answer o)
 
 
 newtype StringOracle = SO ((String, String) -> IO [String])
-                     deriving (Typeable)
 
 instance Oracle StringOracle where
     newtype Question StringOracle = SQ { unSQ :: (String, String) }

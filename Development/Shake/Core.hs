@@ -1,5 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, DeriveDataTypeable, FlexibleInstances, FlexibleContexts #-}
+{-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, FlexibleInstances, FlexibleContexts #-}
 {-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
 module Development.Shake.Core (
     -- * The top-level monadic interface
