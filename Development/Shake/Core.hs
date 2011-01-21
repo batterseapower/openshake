@@ -476,7 +476,9 @@ findAllRules :: Namespace n
 findAllRules _ []       _                   db = return (db, ([], []))
 findAllRules e (fp:fps) would_block_handles db = do
     let ei_unclean_clean = case M.lookup fp db of
+           -- If the file is totally unknown to the database we're certainly going to have to build it
           Nothing                     -> Left Nothing
+           -- Likewise if the file is known but we are the first to notice that the file is dirty, though in this case "building" it might just mean marking it as clean
           Just (Dirty hist mtime)     -> Left (Just (hist, mtime))
            -- We've previously discovered the file to be clean: return an action that just returns the computed entry directly
           Just (Clean _ mtime)        -> Right $ return mtime
@@ -532,23 +534,20 @@ findAllRules e (fp:fps) would_block_handles db = do
                                                                       -- we just rebuild it directly, though we could make another choice:
                                                                       mb_insane_reason <- sanityCheck fp mtime
                                                                       return $ maybe (Left (hist, mtime)) Right mb_insane_reason
-            mb_clean_hist <- case ei_clean_hist_dirty_reason of
-              Left (clean_hist, clean_mtime) -> return (Just (clean_hist, clean_mtime))
+            
+            -- Each rule we execute will block the creation of some files if it waits:
+            --   * It blocks the creation the files it *directly outputs*
+            --   * It blocks the creation of those files that will be created *by the caller* (after we return)
+            --
+            -- Note that any individual rule waiting *does not* block the creation of files built by other rules
+            -- being run right. This is because everything gets executed in parallel.
+            (creates_fps, basic_rule) <- case ei_clean_hist_dirty_reason of
+              Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
               Right dirty_reason -> do
                 when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
-                return Nothing
+                return (potential_creates_fps, potential_rule (e { ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
             
-            let (creates_fps, basic_rule) = case mb_clean_hist of
-                  -- Each rule we execute will block the creation of some files if it waits:
-                  --   * It blocks the creation the files it *directly outputs*
-                  --   * It blocks the creation of those files that will be created *by the caller* (after we return)
-                  --
-                  -- Note that any individual rule waiting *does not* block the creation of files built by other rules
-                  -- being run right. This is because everything gets executed in parallel.
-                  Nothing                        -> (potential_creates_fps, potential_rule (e { ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
-                  Just (clean_hist, clean_mtime) -> ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
-              
-                -- It is possible that we need two different files that are both created by the same rule. This is not an error!
+            let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
                 -- What we should do is remove from the remaning uncleans any files that are created by the rule we just added
                 (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
                 all_fps_satisfied_here = fp : next_fps_satisifed_here
