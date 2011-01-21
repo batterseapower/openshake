@@ -105,7 +105,7 @@ instance Namespace CanonicalFilePath where
             -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
             -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
             -- check will catch the change.
-            Just nested_time -> return $ Just ([fp], GeneratorAct () $ return [(fp, nested_time)]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+            Just nested_time -> return $ Just ([fp], GeneratorAct () $ return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
 
 
 canonical :: FilePath -> IO CanonicalFilePath
@@ -149,7 +149,7 @@ addRule rule = Core.addRule $ \o fp -> do
     cwd <- getCurrentDirectory
     flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
         creates <- mapM (canonical . (cwd </>)) creates
-        return (creates, GeneratorAct o $ act >> mapM (\fp -> fmap ((,) fp) (liftIO $ getCleanFileModTime (filePath fp))) creates)
+        return (creates, GeneratorAct o $ act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
 
 getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp

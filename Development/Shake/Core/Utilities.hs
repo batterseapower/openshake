@@ -105,6 +105,9 @@ mapMaybeM f = go
             Nothing ->             go xs
             Just y  -> liftM (y:) (go xs)
 
+listExtractors :: [[a] -> a]
+listExtractors = head : map (. tail) listExtractors
+
 (?) :: Bool -> (a, a) -> a
 True  ? (t, _) = t
 False ? (_, f) = f
