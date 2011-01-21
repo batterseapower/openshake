@@ -14,6 +14,7 @@ module Development.Shake (
     Act, need, query,
     
     -- * Namespaces
+    Namespace(..), (:<),
     CanonicalFilePath, -- TODO: as an alternative, I could newtype the Shake/Act monads
     
     -- * Oracles, the default oracle and wrappers for the questions it can answer

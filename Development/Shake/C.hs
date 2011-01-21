@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 module Development.Shake.C(
     cppIncludes
   ) where
@@ -13,7 +14,8 @@ import Data.Maybe
 
 import System.FilePath
 
-cppIncludes :: FilePath -> Act CanonicalFilePath o [FilePath] -- TODO: more polymorphism
+cppIncludes :: (CanonicalFilePath :< n, Namespace n)
+            => FilePath -> Act n [FilePath]
 cppIncludes fp = fmap (map (takeDirectory fp </>) . mapMaybe takeInclude) $ readFileLines fp
   where
     -- TODO: should probably do better than this quick and dirty hack

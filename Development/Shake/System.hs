@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 module Development.Shake.System (
     system, system', systemStdout',
     copy, mkdir, readFileLines,
@@ -18,24 +19,24 @@ import System.Directory
 import System.FilePath
 
 
-system' :: [String] -> Act n o ()
+system' :: [String] -> Act n ()
 system' prog = do
     ec <- system prog
     Utilities.checkExitCode prog ec
 
-system :: [String] -> Act n o ExitCode
+system :: [String] -> Act n ExitCode
 system prog = do
     putStrLnAt VerboseVerbosity cmd
     reportCommand cmd $ Process.system cmd
   where cmd = intercalate " " prog
 
-systemStdout' :: [String] -> Act n o String
+systemStdout' :: [String] -> Act n String
 systemStdout' prog = do
     (ec, stdout) <- systemStdout prog
     Utilities.checkExitCode prog ec
     return stdout
 
-systemStdout :: [String] -> Act n o (ExitCode, String)
+systemStdout :: [String] -> Act n (ExitCode, String)
 systemStdout prog = do
     putStrLnAt VerboseVerbosity cmd
     reportCommand cmd $ Utilities.systemStdout cmd
@@ -66,16 +67,18 @@ quote x = "\"" ++ concatMap escape x ++ "\""
 --         escape c | c `elem` must_escape = ['\\', c]
 --                  | otherwise            = [c]
 
-readFileLines :: FilePath -> Act CanonicalFilePath o [String] -- TODO: more polymorphism
+readFileLines :: (CanonicalFilePath :< n, Namespace n)
+              => FilePath -> Act n [String]
 readFileLines x = do
     need [x]
     liftIO $ fmap lines $ readFile x
 
-copy :: FilePath -> FilePath -> Act CanonicalFilePath o () -- TODO: more polymorphism!
+copy :: (CanonicalFilePath :< n, Namespace n)
+     => FilePath -> FilePath -> Act n ()
 copy from to = do
     mkdir $ takeDirectory to
     need [from]
     system' ["cp", quote from, quote to]
 
-mkdir :: FilePath -> Act n o ()
+mkdir :: FilePath -> Act n ()
 mkdir fp = liftIO $ createDirectoryIfMissing True fp
