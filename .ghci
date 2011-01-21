@@ -1,3 +1,3 @@
-:set -Wall
+:set -Wall -fno-warn-name-shadowing
 -- :l "Development/Shake.hs"
 :l "tests/simple-c/Shakefile.hs"
