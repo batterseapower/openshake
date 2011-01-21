@@ -29,6 +29,8 @@ instance Oracle FileSystemOracle where
                                     deriving (Eq, Show, NFData)
     
     queryOracle FSO (Ls pattern) = fmap LsAnswer $ getCurrentDirectory >>= globDir1 (compile pattern)
+    
+    defaultOracle = Just FSO
 
 
 instance Binary (Question FileSystemOracle) where

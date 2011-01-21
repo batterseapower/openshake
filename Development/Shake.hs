@@ -40,4 +40,4 @@ import Development.Shake.Oracles
 
 
 shake :: Shake (UnionName (Question FileSystemOracle) CanonicalFilePath) () -> IO () -- TODO: make ntop polymorphic
-shake act = Core.shake ({- FIXME: installOracle defaultOracle >> -} act)
+shake act = Core.shake act

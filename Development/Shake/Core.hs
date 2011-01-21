@@ -85,7 +85,10 @@ runGetAll :: Get a -> BS.ByteString -> a
 runGetAll act bs = case runGetState act bs 0 of (x, bs', _) -> if BS.length bs' == 0 then x else error $ show (BS.length bs') ++ " unconsumed bytes after reading"
 
 
-class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), NFData n, NFData (Entry n)) => Namespace n where
+class (Ord n, Eq (Entry n),
+       Show n, Show (Entry n),
+       Binary n, Binary (Entry n),
+       NFData n, NFData (Entry n)) => Namespace n where
     type Entry n
     
     -- | Tests whether the cached value for some Dirty entry still appears to be correct. If it is certainly incorrect,

@@ -25,13 +25,23 @@ class (Ord (Question o), Eq (Answer o),
     data Answer o
     
     queryOracle :: o -> Question o -> IO (Answer o)
+    
+    -- | The oracle that will be used if no other oracle of the right type gets explicitly installed
+    defaultOracle :: Maybe o
+    defaultOracle = Nothing
 
 instance Oracle o => Namespace (Question o) where
     type Entry (Question o) = Answer o
 
     sanityCheck _ _ = return Nothing -- No way to sanity check oracle question without running it
-    defaultRule _ = return Nothing -- No default way to answer oracle questions
+    
+    defaultRule q = case defaultOracle of
+        Nothing -> return Nothing
+        Just o  -> liftIO $ oracleRule o q
 
+
+oracleRule :: Oracle o => o -> Question o -> IO (Maybe ([Question o], Act ntop [Answer o]))
+oracleRule o q = return $ Just ([q], fmap return $ liftIO $ queryOracle o q)
 
 installOracle :: (Oracle o, Question o :< ntop) => o -> Shake ntop ()
-installOracle o = addRule $ liftRule $ \q -> return $ Just ([q], fmap return $ liftIO $ queryOracle o q)
+installOracle o = addRule . liftRule $ oracleRule o
