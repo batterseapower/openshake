@@ -103,7 +103,7 @@ main = do
     mtimeSanityCheck
     
     withCurrentDirectory "lexical-scope" $ do
-        clean [".openshake-db"]
+        clean [".openshake-db", "examplefile"]
         
         ec <- shake "Shakefile.hs"
         ExitSuccess `assertEqualM` ec
