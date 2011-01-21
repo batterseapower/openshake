@@ -1,5 +1,6 @@
 {-# LANGUAGE TypeFamilies, TypeSynonymInstances, GeneralizedNewtypeDeriving, StandaloneDeriving, FlexibleContexts, FlexibleInstances, ScopedTypeVariables, TypeOperators, MultiParamTypeClasses #-}
 {-# LANGUAGE OverlappingInstances #-} -- For the subtyping magic
+{-# LANGUAGE ViewPatterns #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -45,7 +46,7 @@ import System.Time (ClockTime(..))
 
 
 type CreatesFiles = [FilePath]
-type Rule o = FilePath -> Maybe (CreatesFiles, Act (ShakeName o) ())
+type Rule ntop o = FilePath -> Maybe (CreatesFiles, Act ntop ())
 
 
 type ModTime = ClockTime
@@ -124,22 +125,7 @@ instance Oracle o => Namespace (Question o) where
     defaultRule _ = return Nothing -- No default way to answer oracle questions
 
 
-defaultOracle :: StringOracle
-defaultOracle = SO go
-  where
-    go ("ls", what) = getCurrentDirectory >>= \cwd -> globDir1 (compile what) cwd
-    go question     = shakefileError $ "The default oracle cannot answer the question " ++ show question
-
-queryStringOracle :: (String, String) -> Act (ShakeName StringOracle) [String]
-queryStringOracle = fmap unSA . query . SQ
-
-ls :: FilePath -> Act (ShakeName StringOracle) [FilePath]
-ls fp = queryStringOracle ("ls", fp)
-
-
 data UnionName n1 n2 = LeftName n1 | RightName n2
-
-type ShakeName o = UnionName (Question o) CanonicalFilePath
 
 instance (Namespace n1, Namespace n2) => Show (UnionName n1 n2) where
     show (LeftName n1) = show n1
@@ -186,6 +172,17 @@ instance (Namespace n1, Namespace n2) => Binary (UnionEntry n1 n2) where
     put (RightEntry e2) = putWord8 1 >> put e2
 
 
+instance (Namespace n1, Namespace n2) => Namespace (UnionName n1 n2) where
+    type Entry (UnionName n1 n2) = UnionEntry n1 n2
+
+    sanityCheck (LeftName n1) (LeftEntry e1) = sanityCheck n1 e1
+    sanityCheck (RightName n2) (RightEntry e2) = sanityCheck n2 e2
+    sanityCheck _ _ = return $ Just "Mismatched name/entry structure"
+
+    defaultRule (LeftName n1) = liftRule' (fromLeftName, fromLeftEntry) (LeftName, LeftEntry) defaultRule (LeftName n1)
+    defaultRule (RightName n2) = liftRule' (fromRightName, fromRightEntry) (RightName, RightEntry) defaultRule (RightName n2)
+
+
 instance Namespace CanonicalFilePath where
     type Entry CanonicalFilePath = ModTime
     
@@ -210,79 +207,33 @@ instance Namespace CanonicalFilePath where
             -- check will catch the change.
             Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
 
-instance (Namespace n1, Namespace n2) => Namespace (UnionName n1 n2) where
-    type Entry (UnionName n1 n2) = UnionEntry n1 n2
-
-    sanityCheck (LeftName n1) (LeftEntry e1) = sanityCheck n1 e1
-    sanityCheck (RightName n2) (RightEntry e2) = sanityCheck n2 e2
-    sanityCheck _ _ = return $ Just "Mismatched name/entry structure"
-    
-    defaultRule (LeftName n1) = liftLeftRule defaultRule (LeftName n1)
-    defaultRule (RightName n2) = liftRightRule defaultRule (RightName n2)
-
-
--- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
--- There is no guarantee about the order in which files will be built: in particular, files mentioned in one
--- 'want' will not necessarily be built before we begin building files in the following 'want'.
-want :: (Oracle o) => [FilePath] -> Shake (ShakeName o) ()
-want = act . need
-
-
-(*>) :: String -> (FilePath -> Act (ShakeName o) ()) -> Shake (ShakeName o) ()
-(*>) pattern action = (compiled `match`) ?> action
-  where compiled = compile pattern
-
-(*@>) :: (String, CreatesFiles) -> (FilePath -> Act (ShakeName o) ()) -> Shake (ShakeName o) ()
-(*@>) (pattern, alsos) action = (\fp -> guard (compiled `match` fp) >> return alsos) ?@> action
-  where compiled = compile pattern
-
-(**>) :: (FilePath -> Maybe a) -> (FilePath -> a -> Act (ShakeName o) ()) -> Shake (ShakeName o) ()
-(**>) p action = addRule $ \fp -> p fp >>= \x -> return ([fp], action fp x)
-
-(**@>) :: (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act (ShakeName o) ()) -> Shake (ShakeName o) ()
-(**@>) p action = addRule $ \fp -> p fp >>= \(creates, x) -> return (creates, action fp x)
-
-(?>) :: (FilePath -> Bool) -> (FilePath -> Act (ShakeName o) ()) -> Shake (ShakeName o) ()
-(?>) p action = addRule $ \fp -> guard (p fp) >> return ([fp], action fp)
-
-(?@>) :: (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act (ShakeName o) ()) -> Shake (ShakeName o) ()
-(?@>) p action = addRule $ \fp -> p fp >>= \creates -> return (creates, action fp)
-
-
-
-liftLeftRule :: Core.Rule' ntop n1 -> Core.Rule' ntop (UnionName n1 n2)
-liftLeftRule = liftRule
-
-liftRightRule :: forall ntop n1 n2. Core.Rule' ntop n2 -> Core.Rule' ntop (UnionName n1 n2)
-liftRightRule = liftRule' fromRightName (RightName, RightEntry) -- TODO: cannot get instance search working here
-
-
 
 liftRule :: (nsub :< nsup) => Core.Rule' ntop nsub -> Core.Rule' ntop nsup
 liftRule = liftRule' downcast upcast
 
-liftRule' :: (nsup -> Maybe nsub)
+liftRule' :: (nsup -> Maybe nsub, Entry nsup -> Maybe (Entry nsub))
           -> (nsub -> nsup, Entry nsub -> Entry nsup)
           -> Rule' ntop nsub -> Rule' ntop nsup
-liftRule' downcast upcast rule ntop = case downcast ntop of
+liftRule' (down_name, _down_entry) (up_name, up_entry) rule ntop = case down_name ntop of
     Nothing -> return Nothing
-    Just n -> liftM (fmap (\(creates, act) -> let (name, entry) = upcast in (map name creates, liftM (map entry) act))) $ rule n
+    Just n -> liftM (fmap (\(creates, act) -> (map up_name creates, liftM (map up_entry) act))) $ rule n
 
 
 class (:<) nsub nsup where
-    downcast :: nsup -> Maybe nsub
+    downcast :: (nsup -> Maybe nsub, Entry nsup -> Maybe (Entry nsub))
     upcast :: (nsub -> nsup, Entry nsub -> Entry nsup) -- Stuff the two functions together to sidestep non-injectivitity of Entry
 
 instance (:<) n n where
-    downcast = Just
+    downcast = (Just, Just)
     upcast = (id, id)
 
 instance (:<) n1 (UnionName n1 n2) where
-    downcast = fromLeftName
+    downcast = (fromLeftName, fromLeftEntry)
     upcast = (LeftName, LeftEntry)
 
 instance ((:<) n1 n3) => (:<) n1 (UnionName n2 n3) where
-    downcast n = fromRightName n >>= downcast
+    downcast = (\n -> fromRightName n >>= name, \e -> fromRightEntry e >>= entry)
+      where (name, entry) = downcast
     upcast = (RightName . name, RightEntry . entry)
       where (name, entry) = upcast
 
@@ -292,29 +243,85 @@ fromLeftName = \n -> case n of RightName _ -> Nothing; LeftName n1 -> Just n1
 fromRightName :: UnionName n1 n2 -> Maybe n2
 fromRightName = \n -> case n of LeftName _ -> Nothing; RightName n2 -> Just n2
 
+fromLeftEntry :: UnionEntry n1 n2 -> Maybe (Entry n1)
+fromLeftEntry = \n -> case n of RightEntry _ -> Nothing; LeftEntry n1 -> Just n1
 
-addRule :: Rule o -> Shake (ShakeName o) ()
-addRule rule = Core.addRule $ liftRightRule $ \fp -> do
+fromRightEntry :: UnionEntry n1 n2 -> Maybe (Entry n2)
+fromRightEntry = \n -> case n of LeftEntry _ -> Nothing; RightEntry n2 -> Just n2
+
+
+-- Needing and adding rules for files
+
+(*>) :: (CanonicalFilePath :< ntop, Namespace ntop)
+     => String -> (FilePath -> Act ntop ()) -> Shake ntop ()
+(*>) pattern action = (compiled `match`) ?> action
+  where compiled = compile pattern
+
+(*@>) :: (CanonicalFilePath :< ntop, Namespace ntop)
+      => (String, CreatesFiles) -> (FilePath -> Act ntop ()) -> Shake ntop ()
+(*@>) (pattern, alsos) action = (\fp -> guard (compiled `match` fp) >> return alsos) ?@> action
+  where compiled = compile pattern
+
+(**>) :: (CanonicalFilePath :< ntop, Namespace ntop)
+      => (FilePath -> Maybe a) -> (FilePath -> a -> Act ntop ()) -> Shake ntop ()
+(**>) p action = addRule $ \fp -> p fp >>= \x -> return ([fp], action fp x)
+
+(**@>) :: (CanonicalFilePath :< ntop, Namespace ntop)
+       => (FilePath -> Maybe ([FilePath], a)) -> (FilePath -> a -> Act ntop ()) -> Shake ntop ()
+(**@>) p action = addRule $ \fp -> p fp >>= \(creates, x) -> return (creates, action fp x)
+
+(?>) :: (CanonicalFilePath :< ntop, Namespace ntop)
+     => (FilePath -> Bool) -> (FilePath -> Act ntop ()) -> Shake ntop ()
+(?>) p action = addRule $ \fp -> guard (p fp) >> return ([fp], action fp)
+
+(?@>) :: (CanonicalFilePath :< ntop, Namespace ntop)
+      => (FilePath -> Maybe CreatesFiles) -> (FilePath -> Act ntop ()) -> Shake ntop ()
+(?@>) p action = addRule $ \fp -> p fp >>= \creates -> return (creates, action fp)
+
+addRule :: (CanonicalFilePath :< ntop, Namespace ntop) => Rule ntop o -> Shake ntop ()
+addRule rule = Core.addRule $ liftRule $ \fp -> do
     cwd <- getCurrentDirectory
     flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
         creates <- mapM (canonical . (cwd </>)) creates
         return (creates, act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
+  where
+    getCleanFileModTime :: FilePath -> IO ModTime
+    getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
-getCleanFileModTime :: FilePath -> IO ModTime
-getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
+need :: (CanonicalFilePath :< ntop, Namespace ntop) => [FilePath] -> Act ntop ()
+need fps = liftIO (mapM (liftM (fst upcast) . canonical) fps) >>= \fps -> Core.need fps >> return ()
 
-need :: Oracle o => [FilePath] -> Act (ShakeName o) ()
-need fps = liftIO (mapM (liftM RightName . canonical) fps) >>= \fps -> Core.need fps >> return ()
+-- | Attempt to build the specified files once are done collecting rules in the 'Shake' monad.
+-- There is no guarantee about the order in which files will be built: in particular, files mentioned in one
+-- 'want' will not necessarily be built before we begin building files in the following 'want'.
+want :: (CanonicalFilePath :< ntop, Namespace ntop) => [FilePath] -> Shake ntop ()
+want = act . need
 
 
-installOracle :: Oracle o => o -> Shake (ShakeName o) ()
-installOracle o = Core.addRule $ liftLeftRule $ \q -> return $ Just ([q], fmap return $ liftIO $ queryOracle o q)
+-- Needing (query) and adding rules (installing) for oracles
 
-query :: Oracle o => Question o -> Act (ShakeName o) (Answer o)
+installOracle :: (Oracle o, Question o :< ntop) => o -> Shake ntop ()
+installOracle o = Core.addRule $ liftRule $ \q -> return $ Just ([q], fmap return $ liftIO $ queryOracle o q)
+
+query :: forall ntop o. (Oracle o, Question o :< ntop, Namespace ntop) => Question o -> Act ntop (Answer o)
 query q = do
-    [LeftEntry a] <- Core.need [LeftName q]
+    [down_entry -> Just a] <- Core.need [up_name q]
     return a
+  where (_down_name :: ntop -> Maybe (Question o), down_entry) = downcast
+        (up_name :: Question o -> ntop, _up_entry) = upcast
+
+queryStringOracle :: (Question StringOracle :< ntop, Namespace ntop) => (String, String) -> Act ntop [String]
+queryStringOracle = fmap unSA . query . SQ
+
+ls :: (Question StringOracle :< ntop, Namespace ntop) => FilePath -> Act ntop [FilePath]
+ls fp = queryStringOracle ("ls", fp)
 
 
-shake :: Shake (ShakeName StringOracle) () -> IO ()
+shake :: Shake (UnionName (Question StringOracle) CanonicalFilePath) () -> IO () -- TODO: make ntop polymorphic
 shake act = Core.shake (installOracle defaultOracle >> act)
+
+defaultOracle :: StringOracle
+defaultOracle = SO go
+  where
+    go ("ls", what) = getCurrentDirectory >>= \cwd -> globDir1 (compile what) cwd
+    go question     = shakefileError $ "The default oracle cannot answer the question " ++ show question
