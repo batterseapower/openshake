@@ -120,7 +120,7 @@ canonical fp = do
 -- There is no guarantee about the order in which files will be built: in particular, files mentioned in one
 -- 'want' will not necessarily be built before we begin building files in the following 'want'.
 want :: (Oracle o) => [FilePath] -> Shake CanonicalFilePath o ()
-want = act . need'
+want = act . need
 
 
 (*>) :: Oracle o => String -> (FilePath -> Act CanonicalFilePath o ()) -> Shake CanonicalFilePath o ()
@@ -155,7 +155,4 @@ getCleanFileModTime :: FilePath -> IO ModTime
 getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
 
 need :: [FilePath] -> Act CanonicalFilePath o ()
-need fps = need' fps >> return ()
-
-need' :: [FilePath] -> Act CanonicalFilePath o [(CanonicalFilePath, ModTime)]
-need' fps = liftIO (mapM canonical fps) >>= Core.need
+need fps = liftIO (mapM canonical fps) >>= \fps -> Core.need fps >> return ()

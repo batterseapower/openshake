@@ -114,12 +114,12 @@ class (Ord n, Eq (Entry n), Show n, Show (Entry n), Binary n, Binary (Entry n), 
 
 type SomeRule n = n -> IO (Maybe (Generator n))
 
-type Generator n = ([n], GeneratorAct n)
-data GeneratorAct n = forall o. Oracle o => GeneratorAct o (Act n o [(n, Entry n)])
+type Generator n = ([n], GeneratorAct n [(n, Entry n)])
+data GeneratorAct n a = forall o. Oracle o => GeneratorAct o (Act n o a)
 
 data ShakeState n = SS {
     ss_rules :: [SomeRule n],
-    ss_acts :: [GeneratorAct n]
+    ss_acts :: [GeneratorAct n ()]
   }
 
 data ShakeEnv n o = SE {
@@ -319,7 +319,7 @@ shake mx = withPool numCapabilities $ \pool -> do
     -- Collect rules and wants, then execute the collected Act actions (in any order)
     let ((), final_s) = runShake (SE { se_oracle = defaultOracle }) (SS { ss_rules = [], ss_acts = [] }) mx
     parallel_ pool $ flip map (ss_acts final_s) $ \(GeneratorAct o act) -> do
-        (_time, _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = o, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
+        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_oracle = o, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
         return ()
     
     -- TODO: put report under command-line control
@@ -411,7 +411,7 @@ ls fp = queryStringOracle ("ls", fp)
 
 -- | Perform the specified action once we are done collecting rules in the 'Shake' monad.
 -- Just like 'want', there is no guarantee about the order in which the actions will be will be performed.
-act :: Oracle o => Act n o [(n, Entry n)] -> Shake n o ()
+act :: Oracle o => Act n o () -> Shake n o ()
 act what = do
     o <- fmap se_oracle askShakeEnv
     modifyShakeState (\s -> s { ss_acts = GeneratorAct o what : ss_acts s })
@@ -429,46 +429,46 @@ addRule mk_rule = do
     o <- fmap se_oracle $ askShakeEnv
     modifyShakeState $ \s -> s { ss_rules = mk_rule o : ss_rules s }
 
-need :: Namespace n => [n] -> Act n o [(n, Entry n)]
+need :: Namespace n => [n] -> Act n o [Entry n]
 need fps = do
     e <- askActEnv
-    need_times <- liftIO $ need'' e fps
+    need_times <- liftIO $ need' e fps
     appendHistory $ Need need_times
-    return need_times
+    return $ fromRight (\fp -> internalError $ "A call to need' didn't return a modification time for the input file " ++ show fp) $ lookupMany fps need_times
 
 withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
 withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -> return (x', y)
 
-need'' :: forall n o. Namespace n => ActEnv n o -> [n] -> IO [(n, Entry n)]
-need'' e init_fps = do
+-- We assume that the rules do not change to include new dependencies often: this lets
+-- us not rerun a rule as long as it looks like the dependencies of the *last known run*
+-- of the rule have not changed
+doesQARequireRerun :: (Namespace n, Oracle o) => ([n] -> IO [(n, Entry n)]) -> o -> QA n -> IO (Maybe String)
+doesQARequireRerun _ o (Oracle td bs_q bs_a) = 
+    case peekOracle td bs_q bs_a of
+        Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
+        Just (question, old_answer) -> do
+          -- The type of the question or answer (or their serialization schemes) might have changed since the last run,
+          -- so check that deserialization gives reasonable results
+          mb_deserialize_error <- (Exception.evaluate (rnf question `seq` rnf old_answer) >> return Nothing) `Exception.catch`
+                                  \(Exception.ErrorCall reason) -> return $ Just $ "question/answer unreadable (" ++ reason ++ "), assuming answer changed"
+          case mb_deserialize_error of
+            Just deserialize_error -> return $ Just deserialize_error
+            Nothing -> do
+              new_answer <- queryOracle o question
+              return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
+doesQARequireRerun need _ (Need nested_fps_times) = do
+    let (nested_fps, nested_old_times) = unzip nested_fps_times
+    -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
+    -- so we recursively invoke need in order to check if we have any changes
+    nested_new_times <- need nested_fps
+    let ([], relevant_nested_new_times) = fromRight (\nested_fp -> internalError $ "The file " ++ show nested_fp ++ " that we needed did not have a modification time in the output") $ lookupRemoveMany nested_fps nested_new_times
+    return $ firstJust $ (\f -> zipWith3 f nested_fps relevant_nested_new_times nested_old_times) $
+        \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
+
+need' :: forall n o. Namespace n => ActEnv n o -> [n] -> IO [(n, Entry n)]
+need' e init_fps = do
     let verbosity = ae_verbosity e
         db_mvar = ae_database e
-        
-        -- We assume that the rules do not change to include new dependencies often: this lets
-        -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
-        -- of the rule have not changed
-        history_requires_rerun :: forall o'. Oracle o' => [BuildingWaitHandle n] -> o' -> QA n -> IO (Maybe String)
-        history_requires_rerun _ o (Oracle td bs_q bs_a) = 
-            case peekOracle td bs_q bs_a of
-                Nothing -> return $ Just "the type of the oracle associated with the rule has changed"
-                Just (question, old_answer) -> do
-                  -- The type of the question or answer (or their serialization schemes) might have changed since the last run,
-                  -- so check that deserialization gives reasonable results
-                  mb_deserialize_error <- (Exception.evaluate (rnf question `seq` rnf old_answer) >> return Nothing) `Exception.catch`
-                                          \(Exception.ErrorCall reason) -> return $ Just $ "question/answer unreadable (" ++ reason ++ "), assuming answer changed"
-                  case mb_deserialize_error of
-                    Just deserialize_error -> return $ Just deserialize_error
-                    Nothing -> do
-                      new_answer <- queryOracle o question
-                      return $ guard (old_answer /= new_answer) >> return ("oracle answer to " ++ show question ++ " has changed from " ++ show old_answer ++ " to " ++ show new_answer)
-        history_requires_rerun would_block_handles _ (Need nested_fps_times) = do
-            let (nested_fps, nested_old_times) = unzip nested_fps_times
-            -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
-            -- so we recursively invoke need in order to check if we have any changes
-            nested_new_times <- need'' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
-            let ([], relevant_nested_new_times) = fromRight (\nested_fp -> internalError $ "The file " ++ show nested_fp ++ " that we needed did not have a modification time in the output") $ lookupRemoveMany nested_fps nested_new_times
-            return $ firstJust $ (\f -> zipWith3 f nested_fps relevant_nested_new_times nested_old_times) $
-                \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
     
         find_all_rules :: [(n, Either (Entry n) (BuildingWaitHandle n))] -> [([n], [n], IO [(n, Entry n)])]
                        -> [n] -> [BuildingWaitHandle n] -> PureDatabase n
@@ -520,7 +520,7 @@ need'' e init_fps = do
     
                     (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing            -> return (db, Right "file was not in the database")
                                                                         Just (hist, mtime) -> withoutMVar db_mvar db $ do
-                                                                          mb_dirty_reason <- firstJustM $ map (history_requires_rerun would_block_handles potential_o) hist
+                                                                          mb_dirty_reason <- firstJustM $ map (doesQARequireRerun (need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e })) potential_o) hist
                                                                           case mb_dirty_reason of
                                                                             Just dirty_reason -> return $ Right dirty_reason
                                                                             Nothing -> do
