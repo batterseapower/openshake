@@ -1,4 +1,5 @@
 -- | Top-level module that exports a commonly-used subset of the Shake API
+{-# LANGUAGE TypeOperators #-}
 module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
@@ -39,5 +40,5 @@ import Development.Shake.Files
 import Development.Shake.Oracles
 
 
-shake :: Shake (UnionName (Question FileSystemOracle) CanonicalFilePath) () -> IO () -- TODO: make ntop polymorphic
+shake :: Shake (Question FileSystemOracle :+: CanonicalFilePath) () -> IO () -- TODO: make ntop polymorphic
 shake act = Core.shake act

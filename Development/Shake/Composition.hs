@@ -2,7 +2,7 @@
 {-# LANGUAGE TypeOperators, MultiParamTypeClasses, FlexibleInstances, OverlappingInstances #-} -- For the (:<) subtyping relation
 module Development.Shake.Composition (
     -- * Composing namespaces
-    UnionName,
+    (:+:),
     
     -- * Subtyping
     (:<), liftRule,
@@ -21,32 +21,36 @@ import Control.DeepSeq
 import Control.Monad
 
 
-data UnionName n1 n2 = LeftName n1 | RightName n2
+-- | Union together two namespaces.
+--
+-- Trees of (:+:) must be right-biased, or the subtyping machinery won't be able to infer
+-- the subtype relationship.
+data (:+:) n1 n2 = LeftName n1 | RightName n2
 
-fromLeftName :: UnionName n1 n2 -> Maybe n1
+fromLeftName :: n1 :+: n2 -> Maybe n1
 fromLeftName = \n -> case n of RightName _ -> Nothing; LeftName n1 -> Just n1
 
-fromRightName :: UnionName n1 n2 -> Maybe n2
+fromRightName :: n1 :+: n2 -> Maybe n2
 fromRightName = \n -> case n of LeftName _ -> Nothing; RightName n2 -> Just n2
 
-instance (Namespace n1, Namespace n2) => Show (UnionName n1 n2) where
+instance (Namespace n1, Namespace n2) => Show (n1 :+: n2) where
     show (LeftName n1) = show n1
     show (RightName n2) = show n2
 
-deriving instance (Namespace n1, Namespace n2) => Eq (UnionName n1 n2)
-deriving instance (Namespace n1, Namespace n2) => Ord (UnionName n1 n2)
+deriving instance (Namespace n1, Namespace n2) => Eq (n1 :+: n2)
+deriving instance (Namespace n1, Namespace n2) => Ord (n1 :+: n2)
 
-instance (Namespace n1, Namespace n2) => NFData (UnionName n1 n2) where
+instance (Namespace n1, Namespace n2) => NFData (n1 :+: n2) where
     rnf (LeftName a) = rnf a
     rnf (RightName a) = rnf a
 
-instance (Namespace n1, Namespace n2) => Binary (UnionName n1 n2) where
+instance (Namespace n1, Namespace n2) => Binary (n1 :+: n2) where
     get = do
         tg <- getWord8
         case tg of
           0 -> liftM LeftName get
           1 -> liftM RightName get
-          _ -> error "get{UnionName n1 n2}: unknown tag"
+          _ -> error "get{(:+:) n1 n2}: unknown tag"
     put (LeftName n1) = putWord8 0 >> put n1
     put (RightName n2) = putWord8 1 >> put n2
 
@@ -80,8 +84,8 @@ instance (Namespace n1, Namespace n2) => Binary (UnionEntry n1 n2) where
     put (RightEntry e2) = putWord8 1 >> put e2
 
 
-instance (Namespace n1, Namespace n2) => Namespace (UnionName n1 n2) where
-    type Entry (UnionName n1 n2) = UnionEntry n1 n2
+instance (Namespace n1, Namespace n2) => Namespace (n1 :+: n2) where
+    type Entry (n1 :+: n2) = UnionEntry n1 n2
 
     sanityCheck (LeftName n1) (LeftEntry e1) = sanityCheck n1 e1
     sanityCheck (RightName n2) (RightEntry e2) = sanityCheck n2 e2
@@ -110,11 +114,11 @@ instance (:<) n n where
     downcast = (Just, Just)
     upcast = (id, id)
 
-instance (:<) n1 (UnionName n1 n2) where
+instance (:<) n1 (n1 :+: n2) where
     downcast = (fromLeftName, fromLeftEntry)
     upcast = (LeftName, LeftEntry)
 
-instance ((:<) n1 n3) => (:<) n1 (UnionName n2 n3) where
+instance ((:<) n1 n3) => (:<) n1 (n2 :+: n3) where
     downcast = (\n -> fromRightName n >>= name, \e -> fromRightEntry e >>= entry)
       where (name, entry) = downcast
     upcast = (RightName . name, RightEntry . entry)
