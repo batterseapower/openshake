@@ -1,4 +1,3 @@
-{-# LANGUAGE Rank2Types #-}
 module Development.Shake.Core.Utilities where
 
 import qualified Control.Exception as Exception
@@ -37,6 +36,10 @@ handleDoesNotExist = handleIf isDoesNotExistError
 handleIf :: Exception.Exception e => (e -> Bool) -> IO a -> IO a -> IO a
 handleIf p handler act = Exception.handleJust (guard . p) (\() -> handler) act
 
+fromRight :: (a -> b) -> Either a b -> b
+fromRight f (Left  a) = f a
+fromRight _ (Right b) = b
+
 expectJust :: String -> Maybe a -> a
 expectJust _   (Just x) = x
 expectJust msg Nothing  = error $ "expectJust: " ++ msg
@@ -46,17 +49,13 @@ lookupRemove _      []           = Nothing
 lookupRemove want_k ((k, v):kvs) | want_k == k = Just (v, kvs)
                                  | otherwise   = fmap (second ((k, v) :)) $ lookupRemove want_k kvs
 
-lookupRemoveMany :: Eq k
-                 => (forall r. k -> r)
-                 -> [k] -> [(k, v)] -> ([(k, v)], [v])
-lookupRemoveMany missing_error ks init_kvs
-  = mapAccumL (\kvs k -> case lookupRemove k kvs of Nothing -> missing_error k
-                                                    Just (v, kvs') -> (kvs', v)) init_kvs ks
+lookupRemoveMany :: Eq k => [k] -> [(k, v)] -> Either k ([(k, v)], [v])
+lookupRemoveMany ks init_kvs
+  = mapAccumLM (\kvs k -> case lookupRemove k kvs of Nothing        -> Left k
+                                                     Just (v, kvs') -> Right (kvs', v)) init_kvs ks
 
-lookupMany :: Eq k
-           => (forall r. k -> r)
-           -> [k] -> [(k, v)] -> [v]
-lookupMany missing_error ks = snd . lookupRemoveMany missing_error ks
+lookupMany :: Eq k => [k] -> [(k, v)] -> Either k [v]
+lookupMany ks = fmap snd . lookupRemoveMany ks
 
 fixEq :: Eq a => (a -> a) -> a -> a
 fixEq f x | x == x'   = x

@@ -466,7 +466,7 @@ need'' e init_fps = do
             -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
             -- so we recursively invoke need in order to check if we have any changes
             nested_new_times <- need'' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }) nested_fps
-            let ([], relevant_nested_new_times) = lookupRemoveMany (\nested_fp -> internalError $ "The file " ++ show nested_fp ++ " that we needed did not have a modification time in the output") nested_fps nested_new_times
+            let ([], relevant_nested_new_times) = fromRight (\nested_fp -> internalError $ "The file " ++ show nested_fp ++ " that we needed did not have a modification time in the output") $ lookupRemoveMany nested_fps nested_new_times
             return $ firstJust $ (\f -> zipWith3 f nested_fps relevant_nested_new_times nested_old_times) $
                 \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
     
@@ -579,7 +579,7 @@ need'' e init_fps = do
         mtimes <- rule
         -- We restrict the list of modification times returned to just those files that were actually needed by the user:
         -- we don't want to add a a dependency on those files that were incidentally created by the rule
-        return $ unclean_fps `zip` lookupMany no_mtime_error unclean_fps mtimes
+        return $ unclean_fps `zip` fromRight no_mtime_error (lookupMany unclean_fps mtimes)
 
     -- NB: we communicate the ModTimes of files that we were waiting on the completion of via the BuildingWaitHandle
     clean_times <- forM cleans $ \(clean_fp, ei_mtime_wait_handle) -> fmap ((,) clean_fp) $ case ei_mtime_wait_handle of
@@ -749,7 +749,7 @@ concurrencyChartURL (width, height) xys
 
 markCleans :: Namespace n => Database n -> History n -> [n] -> [(n, Entry n)] -> IO ()
 markCleans db_mvar nested_hist fps nested_times = modifyMVar_ db_mvar (return . go)
-  where ([], relevant_nested_times) = lookupRemoveMany (\fp -> internalError $ "Rule did not return modification time for the file " ++ show fp ++ " that it claimed to create") fps nested_times
+  where ([], relevant_nested_times) = fromRight (\fp -> internalError $ "Rule did not return modification time for the file " ++ show fp ++ " that it claimed to create") $ lookupRemoveMany fps nested_times
     
         go init_db = foldr (\(fp, nested_time) db -> M.insert fp (Clean nested_hist nested_time) db) init_db (fps `zip` relevant_nested_times)
 
