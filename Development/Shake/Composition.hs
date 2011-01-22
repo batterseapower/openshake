@@ -1,5 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables, StandaloneDeriving, TypeFamilies #-}
-{-# LANGUAGE TypeOperators, MultiParamTypeClasses, FlexibleInstances, OverlappingInstances #-} -- For the (:<) subtyping relation
+{-# LANGUAGE TypeOperators, MultiParamTypeClasses, FlexibleContexts, FlexibleInstances, OverlappingInstances #-} -- For the (:<) subtyping relation
 module Development.Shake.Composition (
     -- * Composing namespaces
     (:+:),
@@ -26,6 +26,8 @@ import Control.Monad
 -- Trees of (:+:) must be right-biased, or the subtyping machinery won't be able to infer
 -- the subtype relationship.
 data (:+:) n1 n2 = LeftName n1 | RightName n2
+
+infixr 1 :+: -- Ensure right-biased construction by default
 
 fromLeftName :: n1 :+: n2 -> Maybe n1
 fromLeftName = \n -> case n of RightName _ -> Nothing; LeftName n1 -> Just n1
@@ -127,10 +129,11 @@ instance ((:<) n1 n3) => (:<) n1 (n2 :+: n3) where
     upcast = (RightName . name, RightEntry . entry)
       where (name, entry) = upcast
 
--- This is a more "experimental" instance that gives us full "width subtyping". I'm not sure
--- if this rule will ever be used, because it depends on GHC trying to decompose the first type
--- argument of (:<) strictly before it decomposes the second type argument.
-instance ((:<) n1 n3, (:<) n2 n3) => (:<) (n1 :+: n2) n3 where
+-- This is a more "experimental" instance that gives us full "width subtyping". We *have* to expand
+-- the second parameter to (n3 :+: n4) or it ambiguously overlaps with the rule above. Luckily this
+-- doesn't make the rule less applicable, because you shouldn't be trying to make (n1 :+: n2) a subtype
+-- of a non-(:+:) type. The only case where that would even make sense is (n1 == n2), which is degenerate.
+instance ((:<) n1 (n3 :+: n4), (:<) n2 (n3 :+: n4)) => (:<) (n1 :+: n2) (n3 :+: n4) where
     downcast = (\n -> fmap LeftName (name1 n) `mplus` fmap RightName (name2 n), \e -> fmap LeftEntry (entry1 e) `mplus` fmap RightEntry (entry2 e))
       where (name1, entry1) = downcast
             (name2, entry2) = downcast
