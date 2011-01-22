@@ -1,5 +1,6 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, CPP, TypeFamilies, FlexibleInstances, FlexibleContexts, DeriveDataTypeable #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, CPP, TypeFamilies, FlexibleInstances, FlexibleContexts, DeriveDataTypeable, TypeOperators #-}
 import Development.Shake
+import qualified Development.Shake.Core as Core
 
 import Control.DeepSeq
 import Control.Monad.IO.Class
@@ -20,9 +21,11 @@ instance Binary (Answer MyOracle) where
 
 
 main :: IO ()
-main = shake $ do
-    oracle (MO 1) $
-      "examplefile" *> \x -> do
-          MOA 1 <- query $ MOQ ()
-          liftIO $ writeFile "examplefile" "OK1"
+main = (Core.shake :: Shake (Question MyOracle :+: CanonicalFilePath) () -> IO ()) $ do
+    installOracle (MO 1)
+    
+    "examplefile" *> \x -> do
+        MOA 1 <- query $ MOQ ()
+        liftIO $ writeFile "examplefile" "OK1"
+    
     want ["examplefile"]
