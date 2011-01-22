@@ -114,15 +114,29 @@ instance (:<) n n where
     downcast = (Just, Just)
     upcast = (id, id)
 
+-- Due to limitations of the Haskell inference machinery, we implement right-biased
+-- search of namespaces composed with (:+:). Left branches match only by direct unification:
 instance (:<) n1 (n1 :+: n2) where
     downcast = (fromLeftName, fromLeftEntry)
     upcast = (LeftName, LeftEntry)
 
+-- We do full search in the right hand subtree:
 instance ((:<) n1 n3) => (:<) n1 (n2 :+: n3) where
     downcast = (\n -> fromRightName n >>= name, \e -> fromRightEntry e >>= entry)
       where (name, entry) = downcast
     upcast = (RightName . name, RightEntry . entry)
       where (name, entry) = upcast
+
+-- This is a more "experimental" instance that gives us full "width subtyping". I'm not sure
+-- if this rule will ever be used, because it depends on GHC trying to decompose the first type
+-- argument of (:<) strictly before it decomposes the second type argument.
+instance ((:<) n1 n3, (:<) n2 n3) => (:<) (n1 :+: n2) n3 where
+    downcast = (\n -> fmap LeftName (name1 n) `mplus` fmap RightName (name2 n), \e -> fmap LeftEntry (entry1 e) `mplus` fmap RightEntry (entry2 e))
+      where (name1, entry1) = downcast
+            (name2, entry2) = downcast
+    upcast = (\n -> case n of LeftName n1 -> name1 n1; RightName n2 -> name2 n2, \e -> case e of LeftEntry e1 -> entry1 e1; RightEntry e2 -> entry2 e2)
+      where (name1, entry1) = upcast
+            (name2, entry2) = upcast
 
 
 need :: forall ntop n. (n :< ntop, Namespace ntop) => [n] -> Act ntop [Entry n]
