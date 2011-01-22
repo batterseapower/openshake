@@ -2,7 +2,7 @@
 {-# LANGUAGE TypeOperators, MultiParamTypeClasses, FlexibleContexts, FlexibleInstances, OverlappingInstances #-} -- For the (:<) subtyping relation
 module Development.Shake.Composition (
     -- * Composing namespaces
-    (:+:),
+    (:+:), Empty,
     
     -- * Subtyping
     (:<), liftRule,
@@ -97,6 +97,23 @@ instance (Namespace n1, Namespace n2) => Namespace (n1 :+: n2) where
     defaultRule (RightName n2) = liftRule' (fromRightName, fromRightEntry) (RightName, RightEntry) defaultRule (RightName n2)
 
 
+-- | It is occasionally useful to have a "unit" namespace that is a subtype of everything. There are no (non-bottom) names of this type.
+data Empty
+
+deriving instance Eq Empty
+deriving instance Ord Empty
+deriving instance Show Empty
+
+instance Binary Empty where
+    get = return (error "Forced a deserialized Empty thunk")
+    put _ = return ()
+
+instance NFData Empty
+
+instance Namespace Empty where
+    type Entry Empty = Empty
+
+
 liftRule :: (nsub :< nsup) => Rule' ntop nsub -> Rule' ntop nsup
 liftRule = liftRule' downcast upcast
 
@@ -140,6 +157,10 @@ instance ((:<) n1 (n3 :+: n4), (:<) n2 (n3 :+: n4)) => (:<) (n1 :+: n2) (n3 :+: 
     upcast = (\n -> case n of LeftName n1 -> name1 n1; RightName n2 -> name2 n2, \e -> case e of LeftEntry e1 -> entry1 e1; RightEntry e2 -> entry2 e2)
       where (name1, entry1) = upcast
             (name2, entry2) = upcast
+
+instance (:<) Empty n where
+    downcast = (const Nothing, const Nothing)
+    upcast = (\_ -> error "Forced an upcasted Empty", \_ -> error "Forced an upcasted Empty entry")
 
 
 need :: forall ntop n. (n :< ntop, Namespace ntop) => [n] -> Act ntop [Entry n]
