@@ -4,7 +4,12 @@
 module Development.Shake.Core (
     -- * The top-level monadic interface
     Shake, shake,
-    addRule, act,
+    
+    -- * Adding rules and controlling their visibility
+    addRule, privateTo, privateTo_,
+    
+    -- * Setting up initial actions
+    act,
 
     -- * Rules
     Rule, Rule', Generator, Generator',
@@ -112,19 +117,28 @@ class (Ord n, Eq (Entry n),
 type Rule' ntop n = n -> IO (Maybe (Generator' ntop n))
 type Rule n = Rule' n n
 
+data RuleClosure n = RC {
+    rc_closure :: [[RuleClosure n]], -- ^ Rules closed over. Outermost list represents levels of nested, closly bound rules are near the front. Innermost list represents multiplicity of rules at a level.
+    rc_rule :: Rule n
+  }
+
 type Generator' ntop n = ([n], Act ntop [Entry n])
 type Generator n = Generator' n n
 
-data ShakeState n = SS {
-    ss_rules :: [Rule n],
-    ss_acts :: [Act n ()]
+newtype ShakeEnv n = SE {
+    se_available_rules :: [[RuleClosure n]]
   }
 
-newtype Shake n a = Shake { unShake :: State.State (ShakeState n) a }
+data ShakeState n = SS {
+    ss_rules :: [RuleClosure n],
+    ss_acts :: [([[RuleClosure n]], Act n ())]
+  }
+
+newtype Shake n a = Shake { unShake :: State.StateT (ShakeState n) (Reader.Reader (ShakeEnv n)) a }
                   deriving (Functor, Applicative, Monad)
 
-runShake :: ShakeState n -> Shake n a -> (a, ShakeState n)
-runShake s mx = State.runState (unShake mx) s
+runShake :: ShakeEnv n -> ShakeState n -> Shake n a -> (a, ShakeState n)
+runShake e s mx = Reader.runReader (State.runStateT (unShake mx) s) e
 
 -- getShakeState :: Shake n (ShakeState n)
 -- getShakeState = Shake (lift State.get)
@@ -132,8 +146,27 @@ runShake s mx = State.runState (unShake mx) s
 -- putShakeState :: ShakeState -> Shake ()
 -- putShakeState s = Shake (lift (State.put s))
 
+asksShakeEnv :: (ShakeEnv n -> a) -> Shake n a
+asksShakeEnv extract = Shake $ lift $ Reader.asks extract
+
 modifyShakeState :: (ShakeState n -> ShakeState n) -> Shake n ()
 modifyShakeState f = Shake (State.modify f)
+
+
+-- | The rules created by the first action supplied to 'privateTo' will be visible only to
+-- themselves and the second action supplied to 'privateTo'. However, any rules created
+-- by the second action will be visible both in the outside world and within the first action.
+--
+-- Thus, the first action creates rules that are "private" and do not leak out. This can be
+-- helpful if you want to override particular 'need' calls with specialised actions.
+privateTo :: Shake n a -> (a -> Shake n b) -> Shake n b
+privateTo privates private_to = Shake $ State.StateT $ \s -> Reader.reader $ \e -> let (a, s') = Reader.runReader (State.runStateT (unShake privates) (s { ss_rules = [] })) e_private
+                                                                                       e_private = e { se_available_rules = ss_rules s' : se_available_rules e }
+                                                                                   in Reader.runReader (State.runStateT (unShake (private_to a)) (s' { ss_rules = ss_rules s })) e_private
+
+-- | Version of 'privateTo' where the two nested actions don't return anything
+privateTo_ :: Shake n () -> Shake n () -> Shake n ()
+privateTo_ privates private_to = privateTo privates (\() -> private_to)
 
 
 type Database n = MVar (PureDatabase n)
@@ -199,7 +232,7 @@ data ActState n = AS {
 data ActEnv n = AE {
     ae_would_block_handles :: [WaitHandle ()], -- ^ A list of handles that would be incapable of awakening if the action were to
                                                --   block indefinitely here and now. This is used in the deadlock detector.
-    ae_global_rules :: [Rule n],
+    ae_rules :: [[RuleClosure n]],
     ae_database :: Database n,
     ae_wait_database :: MVar (WaitDatabase n),
     ae_report :: MVar ReportDatabase,
@@ -265,9 +298,9 @@ shake mx = withPool numCapabilities $ \pool -> do
     report_mvar <- emptyReportDatabase >>= newMVar
 
     -- Collect rules and wants, then execute the collected Act actions (in any order)
-    let ((), final_s) = runShake (SS { ss_rules = [], ss_acts = [] }) mx
-    parallel_ pool $ flip map (ss_acts final_s) $ \act -> do
-        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_global_rules = ss_rules final_s, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
+    let ((), final_s) = runShake (SE { se_available_rules = [ss_rules final_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
+    parallel_ pool $ flip map (ss_acts final_s) $ \(act_rules, act) -> do
+        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
         return ()
     
     -- TODO: put report under command-line control
@@ -281,11 +314,15 @@ shake mx = withPool numCapabilities $ \pool -> do
 -- | Perform the specified action once we are done collecting rules in the 'Shake' monad.
 -- Just like 'want', there is no guarantee about the order in which the actions will be will be performed.
 act :: Act n () -> Shake n ()
-act what = modifyShakeState (\s -> s { ss_acts = what : ss_acts s })
+act what = do
+    rules <- asksShakeEnv se_available_rules
+    modifyShakeState (\s -> s { ss_acts = (rules, what) : ss_acts s })
 
 
 addRule :: Rule n -> Shake n ()
-addRule rule = modifyShakeState $ \s -> s { ss_rules = rule : ss_rules s }
+addRule rule = do
+    rules <- asksShakeEnv se_available_rules
+    modifyShakeState $ \s -> s { ss_rules = RC rules rule : ss_rules s }
 
 need :: Namespace n => [n] -> Act n [Entry n]
 need fps = do
@@ -342,7 +379,7 @@ findAllRules e (fp:fps) would_block_handles db = do
         Left mb_hist -> do
           -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
           -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild:
-          findRule verbosity (ae_global_rules e) fp $ \(potential_creates_fps, potential_rule) -> do
+          findRule verbosity (ae_rules e) fp $ \(potential_creates_fps, potential_rule) -> do
             -- 1) Basic sanity check that the rule creates the file we actually need
             unless (fp `elem` potential_creates_fps) $ shakefileError $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
 
@@ -389,7 +426,7 @@ findAllRules e (fp:fps) would_block_handles db = do
               Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
               Right dirty_reason -> do
                 when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
-                return (potential_creates_fps, potential_rule (e { ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
+                return (potential_creates_fps, potential_rule (\rules -> e { ae_rules = rules, ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
             
             let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
                 -- What we should do is remove from the remaning uncleans any files that are created by the rule we just added
@@ -599,15 +636,17 @@ appendHistory :: QA n -> Act n ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
 -- NB: when the found rule returns, the input file will be clean (and probably some others, too..)
-type RuleFinder n = forall r. Verbosity -> [Rule n] -> n
-                           -> (([n], ActEnv n -> (IO (History n, [Entry n]))) -> IO r)
+type RuleFinder n = forall r. Verbosity -> [[RuleClosure n]] -> n
+                           -> (([n], ([[RuleClosure n]] -> ActEnv n) -> (IO (History n, [Entry n]))) -> IO r)
                            -> IO r
 findRule :: Namespace n => RuleFinder n
-findRule verbosity rules fp k = do
-    possibilities <- mapMaybeM ($ fp) rules
+findRule verbosity ruless fp k = do
+    possibilities <- flip mapMaybeM ruless $ \rules -> do
+        generators <- mapMaybeM (\rc -> liftM (fmap ((,) (rc_closure rc))) $ rc_rule rc fp) rules
+        return (guard (not (null generators)) >> Just generators)
     -- To make sure we choose the first rule, we need to reverse the list of matches (we add them in reverse order)
-    (creates_fps, action) <- case reverse possibilities of
-      generator:other_matches -> do
+    (clo_rules, (creates_fps, action)) <- case reverse possibilities of
+      (generator:other_matches):_next_level -> do
           unless (null other_matches) $
             when (verbosity > NormalVerbosity) $
               putStrLn $ "Ambiguous rules for " ++ show fp ++ ": choosing the first one"
@@ -616,8 +655,8 @@ findRule verbosity rules fp k = do
           mb_generator <- defaultRule fp
           case mb_generator of
             Nothing        -> shakefileError $ "No rule to build " ++ show fp
-            Just generator -> return generator
+            Just generator -> return $ ([], generator) -- TODO: generalise to allow default rules to refer to others?
 
-    k (creates_fps, \e -> do
-        (creates_times, final_nested_s) <- runAct e (AS { as_this_history = [] }) action
+    k (creates_fps, \mk_e -> do
+        (creates_times, final_nested_s) <- runAct (mk_e clo_rules) (AS { as_this_history = [] }) action
         return (as_this_history final_nested_s, creates_times))
