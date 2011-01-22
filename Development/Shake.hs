@@ -4,8 +4,9 @@ module Development.Shake (
     -- * The top-level monadic interface
     Shake, shake,
     
-    -- * Adding file rules in the Shake monad
-    Rule, CreatesFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>), addRule,
+    -- * Adding file rules in the Shake monad and controlling their visibility
+    Rule, CreatesFiles, (*>), (*@>), (**>), (**@>), (?>), (?@>),
+    addRule, privateTo, privateTo_,
     
     -- * Demanding files and other things in the Shake monad
     want, act,
@@ -19,8 +20,8 @@ module Development.Shake (
     -- * The file system oracle, and wrappers for the questions it can answer
     FileSystemOracle, ls,
     
-    -- * Namespaces
-    Namespace(..), (:<),
+    -- * Namespaces and namespace composition
+    Namespace(..), (:+:), (:<),
     
     -- * The file namespace
     CanonicalFilePath, -- TODO: as an alternative, I could newtype the Shake/Act monads?

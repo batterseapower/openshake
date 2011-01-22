@@ -5,7 +5,7 @@ module Development.Shake.Core (
     -- * The top-level monadic interface
     Shake, shake,
     
-    -- * Adding rules and controlling their visibility
+    -- * Adding rules in the Shake monad and controlling their visibility
     addRule, privateTo, privateTo_,
     
     -- * Setting up initial actions

@@ -1,7 +1,7 @@
 {-# LANGUAGE TypeFamilies, FlexibleContexts, FlexibleInstances, GeneralizedNewtypeDeriving #-}
 module Development.Shake.Oracles.String (
     -- * Oracle type
-    StringOracle,
+    StringOracle(..),
     
     -- * Oracle operations
     queryStringOracle
@@ -19,14 +19,14 @@ import Control.DeepSeq
 import Control.Monad
 
 
-newtype StringOracle = SO ((String, String) -> IO [String])
+newtype StringOracle = StringOracle ((String, String) -> IO [String])
 
 instance Oracle StringOracle where
     newtype Question StringOracle = SQ { unSQ :: (String, String) }
                                   deriving (Eq, Ord, Show, NFData)
     newtype Answer StringOracle = SA { unSA :: [String] }
                                 deriving (Eq, Show, NFData)
-    queryOracle (SO f) = fmap SA . f . unSQ
+    queryOracle (StringOracle f) = fmap SA . f . unSQ
 
 instance Binary (Question StringOracle) where
     get = fmap SQ $ liftM2 (,) getUTF8String getUTF8String
