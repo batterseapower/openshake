@@ -28,7 +28,6 @@ import Control.DeepSeq
 import Control.Monad
 import Control.Monad.IO.Class
 
-import Data.Maybe
 import Data.Traversable (Traversable(traverse))
 
 import System.Directory
@@ -145,7 +144,7 @@ addRule rule = Core.addRule $ liftRule $ \fp -> do
         return (creates, mapM_ (liftIO . createDirectoryIfMissing True . takeDirectory . filePath) creates >> act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
   where
     getCleanFileModTime :: FilePath -> IO ModTime
-    getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp
+    getCleanFileModTime fp = getFileModTime fp >>= maybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp) return
 
 
 need :: (CanonicalFilePath :< ntop, Namespace ntop) => [FilePath] -> Act ntop ()

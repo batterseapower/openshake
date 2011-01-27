@@ -1,6 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, FlexibleInstances, FlexibleContexts #-}
 {-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
+{-# LANGUAGE DeriveDataTypeable #-} -- For Exception only
 module Development.Shake.Core (
     -- * The top-level monadic interface
     Shake, shake,
@@ -38,6 +39,8 @@ import Data.Binary
 import Data.Binary.Get
 import Data.Binary.Put
 import qualified Data.ByteString.Lazy as BS
+
+import Data.Typeable (Typeable) -- For Exception only
 
 import Control.Applicative (Applicative)
 import Control.Arrow (first, second)
@@ -79,8 +82,17 @@ data Verbosity = SilentVerbosity | QuietVerbosity | NormalVerbosity | VerboseVer
                deriving (Show, Enum, Bounded, Eq, Ord)
 
 
-shakefileError :: String -> a
-shakefileError s = error $ "Your Shakefile contained an error: " ++ s
+newtype ShakefileException = ShakefileException { shakefileException :: String }
+                           deriving (Typeable)
+
+instance Show ShakefileException where
+    show = shakefileException
+
+instance Exception.Exception ShakefileException
+
+
+shakefileError :: String -> IO a
+shakefileError s = Exception.throwIO $ ShakefileException $ "Your Shakefile contained an error: " ++ s
 
 internalError :: String -> a
 internalError s = error $ "Internal Shake error: " ++ s
@@ -515,11 +527,11 @@ emptyWaitDatabase = WDB {
 registerWait :: forall n a. (Show n, Eq n) => MVar (WaitDatabase n) -> n -> WaitHandle () -> [WaitHandle ()] -> IO a -> IO a
 registerWait mvar_wdb new_why new_handle new_will_block_handles act = Exception.bracket register unregister (\_ -> act)
   where
-    register = modifyMVar mvar_wdb (Exception.evaluate . register')
+    register = modifyMVar mvar_wdb register'
     register' (WDB new_waitno waiters)
       = case [why_chain | (why_chain, handle) <- transitive [([new_why], new_will_block_handle) | new_will_block_handle <- new_will_block_handles], new_handle == handle] of
           why_chain:_ -> shakefileError $ "Cyclic dependency detected through the chain " ++ showStringList (map show why_chain)
-          []          -> (wdb', new_waitno)
+          []          -> return (wdb', new_waitno)
       where
         -- Update the database with the new waiters on this WaitHandle. We are careful to ensure that any
         -- existing waiters on the handle are preserved and put into the same entry in the association list.
