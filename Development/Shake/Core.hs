@@ -1,6 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies, ExistentialQuantification, Rank2Types, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving #-}
+{-# LANGUAGE TypeSynonymInstances, StandaloneDeriving, TupleSections #-}
 {-# LANGUAGE DeriveDataTypeable #-} -- For Exception only
 module Development.Shake.Core (
     -- * The top-level monadic interface
@@ -83,7 +83,7 @@ data Verbosity = SilentVerbosity | QuietVerbosity | NormalVerbosity | VerboseVer
                deriving (Show, Enum, Bounded, Eq, Ord)
 
 
-data ShakefileException = RuleError String | forall e. Exception.Exception e => ActionError e | RecursiveError [ShakefileException]
+data ShakefileException = RuleError String | forall e. Exception.Exception e => ActionError e | RecursiveError [([String], ShakefileException)]
                         deriving (Typeable)
 
 instance Show ShakefileException where
@@ -92,7 +92,7 @@ instance Show ShakefileException where
 showShakefileException :: ShakefileException -> [String]
 showShakefileException (RuleError s)         = ["Error in rule definition: " ++ s]
 showShakefileException (ActionError e)       = ["Error in rule action: " ++ show e]
-showShakefileException (RecursiveError sfes) = "Error due to dependents:" : concatMap (\sfe -> map ("  " ++) (showShakefileException sfe)) sfes
+showShakefileException (RecursiveError sfes) = "Error due to dependents:" : concatMap (\(fps, sfe) -> (' ' : showStringList fps ++ ":") : map ("  " ++) (showShakefileException sfe)) sfes
 
 instance NFData ShakefileException where
     rnf (RuleError a) = rnf a
@@ -519,13 +519,13 @@ need' e init_fps = do
     -- NB: we report that the thread using parallel is blocked because it may go on to actually
     -- execute one of the parallel actions, which will bump the parallelism count without any
     -- extra parallelism actually occuring.
-    unclean_timess <- reportWorkerBlocked (ae_report e) $ parallel (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ liftM (fmap (unclean_fps `zip`)) rule
+    unclean_times <- reportWorkerBlocked (ae_report e) $ parallel (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ liftM (fmapEither (map show unclean_fps,) (unclean_fps `zip`)) rule
 
     -- For things that are being built by someone else we only do trivial work, so don't have to spawn any thread
-    clean_times <- forM cleans $ \(clean_fp, rule) -> liftM (fmap ((,) clean_fp)) rule
+    clean_times <- forM cleans $ \(clean_fp, rule) -> liftM (fmapEither ([show clean_fp],) (\mtime -> [(clean_fp, mtime)])) rule
     
     -- Gather up any failures experienced in recursive needs, and the modtimes for files that were built succesfully
-    let (failures, all_timess) = partitionEithers $ unclean_timess ++ map (fmap return) clean_times
+    let (failures, all_timess) = partitionEithers $ unclean_times ++ clean_times
         ([], reordered_times) = fromRight (\fp -> internalError $ "A call to need' didn't return a modification time for the input file " ++ show fp) $ lookupRemoveMany init_fps (concat all_timess)
     
     if null failures

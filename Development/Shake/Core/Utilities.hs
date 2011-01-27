@@ -40,6 +40,10 @@ fromRight :: (a -> b) -> Either a b -> b
 fromRight f (Left  a) = f a
 fromRight _ (Right b) = b
 
+fmapEither :: (a -> b) -> (c -> d) -> Either a c -> Either b d
+fmapEither f _ (Left x)  = Left  (f x)
+fmapEither _ g (Right y) = Right (g y)
+
 expectJust :: String -> Maybe a -> a
 expectJust _   (Just x) = x
 expectJust msg Nothing  = error $ "expectJust: " ++ msg

@@ -60,26 +60,31 @@ getFileModTime :: FilePath -> IO (Maybe ModTime)
 getFileModTime fp = handleDoesNotExist (return Nothing) (fmap Just (getModificationTime fp))
 
 
-newtype CanonicalFilePath = UnsafeCanonicalise { filePath :: FilePath }
-                          deriving (Ord, NFData)
+data CanonicalFilePath = UnsafeCanonicalise { originalFilePath :: FilePath, canonicalFilePath :: FilePath }
 
 instance Show CanonicalFilePath where
-    show = filePath -- TODO: confirm that Show is only used in errors, and use Pretty instead?
+    show = originalFilePath -- TODO: confirm that Show is only used in errors, and use Pretty instead?
 
 instance Eq CanonicalFilePath where
-    cfp1 == cfp2 = filePath cfp1 `equalFilePath` filePath cfp2
+    cfp1 == cfp2 = canonicalFilePath cfp1 `equalFilePath` canonicalFilePath cfp2
+
+instance Ord CanonicalFilePath where
+    cfp1 `compare` cfp2 = canonicalFilePath cfp1 `compare` canonicalFilePath cfp2
+
+instance NFData CanonicalFilePath where
+    rnf (UnsafeCanonicalise a b) = rnf a `seq` rnf b
 
 instance Binary CanonicalFilePath where
-    get = fmap UnsafeCanonicalise getUTF8String
-    put = putUTF8String . filePath
+    get = liftM2 UnsafeCanonicalise getUTF8String getUTF8String
+    put (UnsafeCanonicalise fp1 fp2) = putUTF8String fp1 >> putUTF8String fp2
 
 
 canonical :: FilePath -> IO CanonicalFilePath
 canonical fp = do
     exists <- doesFileExist fp
     if exists
-      then fmap UnsafeCanonicalise $ canonicalizePath fp
-      else fmap (UnsafeCanonicalise . (</> fp)) getCurrentDirectory
+      then fmap (UnsafeCanonicalise fp) $ canonicalizePath fp
+      else fmap (UnsafeCanonicalise fp . (</> fp)) getCurrentDirectory
 
 
 instance Namespace CanonicalFilePath where
@@ -94,11 +99,11 @@ instance Namespace CanonicalFilePath where
     --   * Cache the ModTime
     --   * Sanity check the current ModTime against the current one
     --   * Thus we detect changes in this file since the last run, so changed files will be rebuilt even if their dependents haven't changed
-    sanityCheck fp old_mtime = getFileModTime (filePath fp) >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
+    sanityCheck fp old_mtime = getFileModTime (canonicalFilePath fp) >>= \mb_new_mtime -> return $ guard (mb_new_mtime /= Just old_mtime) >> Just "the file has been modified (or deleted) even though its dependents have not changed"
     
     defaultRule fp = do
         -- Not having a rule might still be OK, as long as there is some existing file here:
-        mb_nested_time <- getFileModTime (filePath fp)
+        mb_nested_time <- getFileModTime (canonicalFilePath fp)
         case mb_nested_time of
             Nothing          -> return Nothing
             -- NB: it is important that this fake oracle is not reachable if we change from having a rule for a file to not having one,
@@ -139,9 +144,9 @@ type Rule ntop o = FilePath -> Maybe (CreatesFiles, Act ntop ())
 addRule :: (CanonicalFilePath :< ntop, Namespace ntop) => Rule ntop o -> Shake ntop ()
 addRule rule = Core.addRule $ liftRule $ \fp -> do
     cwd <- getCurrentDirectory
-    flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
+    flip traverse (rule (makeRelative cwd (canonicalFilePath fp))) $ \(creates, act) -> do
         creates <- mapM (canonical . (cwd </>)) creates
-        return (creates, mapM_ (liftIO . createDirectoryIfMissing True . takeDirectory . filePath) creates >> act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
+        return (creates, mapM_ (liftIO . createDirectoryIfMissing True . takeDirectory . canonicalFilePath) creates >> act >> mapM (liftIO . getCleanFileModTime . canonicalFilePath) creates)
   where
     getCleanFileModTime :: FilePath -> IO ModTime
     getCleanFileModTime fp = getFileModTime fp >>= maybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp) return
