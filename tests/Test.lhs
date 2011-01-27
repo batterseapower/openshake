@@ -14,7 +14,10 @@ import System.FilePath
 import System.Process
 import System.Timeout
 
+import System.IO
 import System.IO.Temp
+
+import Data.List
 
 import Debug.Trace
 
@@ -60,15 +63,18 @@ timeoutForeign microsecs cleanup act = flip Exception.finally cleanup $ do
     forkIO $ act >>= putMVar mvar -- NB: leaves the foreign thing running even once the timeout has passed!
     timeout microsecs $ takeMVar mvar
 
-shake :: FilePath -> IO ExitCode
+shake_ :: FilePath -> IO ExitCode
+shake_ fp = fmap fst $ shake fp
+
+shake :: FilePath -> IO (ExitCode, String)
 shake fp = do
    extra_args <- getArgs -- NB: this is a bit of a hack!
    
-   ph <- runProcess "runghc" (["-i../../", fp] ++ extra_args) Nothing Nothing Nothing Nothing Nothing
+   (_h_stdin, _h_stdout, h_stderr, ph) <- runInteractiveProcess "runghc" (["-i../../", fp] ++ extra_args) Nothing Nothing
    mb_ec <- timeoutForeign (seconds 5) (terminateProcess ph) $ waitForProcess ph
    case mb_ec of
      Nothing -> error "shake took too long to run!"
-     Just ec -> return ec
+     Just ec -> fmap ((,) ec) $ hGetContents h_stderr
 
 -- | Shake can only detect changes that are reflected by changes to the modification time.
 -- Thus if we expect a rebuild we need to wait for the modification time used by the system to actually change.
@@ -105,7 +111,7 @@ main = do
     withCurrentDirectory "lexical-scope" $ do
         clean [".openshake-db", "examplefile"]
         
-        ec <- shake "Shakefile.hs"
+        ec <- shake_ "Shakefile.hs"
         ExitSuccess `assertEqualM` ec
     
     withCurrentDirectory "simple-c" $ do
@@ -116,7 +122,7 @@ main = do
         forM_ [42, 43] $ \constant -> do
             writeFile "constants.h" $ "#define MY_CONSTANT " ++ show constant
             
-            ec <- shake "Shakefile.hs"
+            ec <- shake_ "Shakefile.hs"
             ExitSuccess `assertEqualM` ec
         
             out <- readProcess "./Main" [] ""
@@ -127,14 +133,14 @@ main = do
         -- 2) Run without changing any files, to make sure that nothing gets spuriously rebuilt:
         let interesting_files = ["Main", "main.o"]
         old_mtimes <- mapM getModificationTime interesting_files
-        ec <- shake "Shakefile.hs"
+        ec <- shake_ "Shakefile.hs"
         ExitSuccess `assertEqualM` ec
         new_mtimes <- mapM getModificationTime interesting_files
         old_mtimes `assertEqualM` new_mtimes
         
         -- 3) Corrupt the database and check that Shake recovers
         writeFile ".openshake-db" "Junk!"
-        ec <- shake "Shakefile.hs"
+        ec <- shake_ "Shakefile.hs"
         ExitSuccess `assertEqualM` ec
 
     -- TODO: test that nothing goes wrong if we change the type of oracle between runs
@@ -143,21 +149,21 @@ main = do
         clean [".openshake-db", "examplefile"]
         
         -- 1) First run has no database, so it is forced to create the file
-        ec <- shake "Shakefile-1.hs"
+        ec <- shake_ "Shakefile-1.hs"
         ExitSuccess `assertEqualM` ec
         
         x <- readFile "examplefile"
         "OK1" `assertEqualM` x
         
         -- 2) The second run has a "corrupt" database because answer serialisation is shorter
-        ec <- shake "Shakefile-2.hs"
+        ec <- shake_ "Shakefile-2.hs"
         ExitSuccess `assertEqualM` ec
         
         x <- readFile "examplefile"
         "OK2" `assertEqualM` x
         
         -- 2) The second run has a "corrupt" database because question serialisation is longer
-        ec <- shake "Shakefile-3.hs"
+        ec <- shake_ "Shakefile-3.hs"
         ExitSuccess `assertEqualM` ec
         
         x <- readFile "examplefile"
@@ -166,20 +172,28 @@ main = do
     withCurrentDirectory "cyclic" $ do
         clean [".openshake-db"]
         
-        ec <- shake "Shakefile.hs"
+        ec <- shake_ "Shakefile.hs"
         isExitFailure `assertIsM` ec
     
     withCurrentDirectory "cyclic-harder" $ do
         clean [".openshake-db"]
     
-        ec <- shake "Shakefile.hs"
+        ec <- shake_ "Shakefile.hs"
         isExitFailure `assertIsM` ec
 
     withCurrentDirectory "creates-directory-implicitly" $ do
         clean [".openshake-db", "subdirectory" </> "foo"]
         
         -- Even though our rule does not create the directory it is building into it should succeed
-        ec <- shake "Shakefile.hs"
+        ec <- shake_ "Shakefile.hs"
         ExitSuccess `assertEqualM` ec
+
+    withCurrentDirectory "lazy-exceptions" $ do
+        clean [".openshake-db", "foo-dependency3"]
+        
+        -- Even though our rule does not create the directory it is building into it should succeed
+        (ec, stderr) <- shake "Shakefile.hs"
+        isExitFailure `assertIsM` ec
+        (\x -> all (`isInfixOf` x) ["No rule to build", "User error in foo-dependency2", "User error in bar rule"]) `assertIsM` stderr
 
 \end{code}
