@@ -32,7 +32,7 @@ import Data.Maybe
 import Data.Traversable (Traversable(traverse))
 
 import System.Directory
-import System.FilePath (equalFilePath, makeRelative, (</>))
+import System.FilePath (takeDirectory, equalFilePath, makeRelative, (</>))
 import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
@@ -142,7 +142,7 @@ addRule rule = Core.addRule $ liftRule $ \fp -> do
     cwd <- getCurrentDirectory
     flip traverse (rule (makeRelative cwd (filePath fp))) $ \(creates, act) -> do
         creates <- mapM (canonical . (cwd </>)) creates
-        return (creates, act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
+        return (creates, mapM_ (liftIO . createDirectoryIfMissing True . takeDirectory . filePath) creates >> act >> mapM (liftIO . getCleanFileModTime . filePath) creates)
   where
     getCleanFileModTime :: FilePath -> IO ModTime
     getCleanFileModTime fp = fmap (fromMaybe (shakefileError $ "The rule did not create a file that it promised to create " ++ fp)) $ getFileModTime fp

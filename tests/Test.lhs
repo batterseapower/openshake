@@ -175,4 +175,11 @@ main = do
         ec <- shake "Shakefile.hs"
         isExitFailure `assertIsM` ec
 
+    withCurrentDirectory "creates-directory-implicitly" $ do
+        clean [".openshake-db", "subdirectory" </> "foo"]
+        
+        -- Even though our rule does not create the directory it is building into it should succeed
+        ec <- shake "Shakefile.hs"
+        ExitSuccess `assertEqualM` ec
+
 \end{code}
