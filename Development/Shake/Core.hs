@@ -4,7 +4,8 @@
 {-# LANGUAGE DeriveDataTypeable #-} -- For Exception only
 module Development.Shake.Core (
     -- * The top-level monadic interface
-    Shake, shake,
+    Shake, shake, shakeWithOptions,
+    ShakeOptions(..), defaultShakeOptions,
     
     -- * Adding rules in the Shake monad and controlling their visibility
     addRule, privateTo, privateTo_,
@@ -66,8 +67,10 @@ import Data.Maybe
 import Data.Ord
 import Data.List
 import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
+import Data.Foldable (traverse_)
 
 import System.Environment
+import System.IO.Unsafe (unsafePerformIO) -- For command line parsing hack only
 
 import GHC.Conc (numCapabilities)
 
@@ -147,6 +150,28 @@ data RuleClosure n = RC {
 
 type Generator' ntop n = ([n], Act ntop [Entry n])
 type Generator n = Generator' n n
+
+data ShakeOptions = ShakeOptions {
+    shakeVerbosity :: Verbosity,  -- ^ Verbosity of logging
+    shakeThreads :: Int,          -- ^ Number of simultaneous build actions to run
+    shakeReport :: Maybe FilePath -- ^ File to write build report to, if any
+  }
+
+defaultShakeOptions :: ShakeOptions
+defaultShakeOptions = ShakeOptions {
+    shakeVerbosity = unsafePerformIO verbosity,
+    shakeThreads = numCapabilities,
+    shakeReport = Just "openshake-report.html"
+  }
+  where
+    -- TODO: when we have more command line options, use a proper command line argument parser.
+    -- We should also work out whether shake should be doing argument parsing at all, given that it's
+    -- meant to be used as a library function...
+    verbosity = fmap (\args -> fromMaybe NormalVerbosity $ listToMaybe $ reverse [ case rest of ""  -> VerboseVerbosity
+                                                                                                "v" -> ChattyVerbosity
+                                                                                                _   -> toEnum (fromEnum (minBound :: Verbosity) `max` read rest `min` fromEnum (maxBound :: Verbosity))
+                                                                                 | '-':'v':rest <- args ]) getArgs
+
 
 newtype ShakeEnv n = SE {
     se_available_rules :: [[RuleClosure n]]
@@ -263,7 +288,7 @@ data ActEnv n = AE {
     ae_wait_database :: MVar (WaitDatabase n),
     ae_report :: MVar ReportDatabase,
     ae_pool :: Pool,
-    ae_verbosity :: Verbosity
+    ae_options :: ShakeOptions
   }
 
 
@@ -286,7 +311,7 @@ askActEnv :: Act n (ActEnv n)
 askActEnv = Act Reader.ask
 
 actVerbosity :: Act n Verbosity
-actVerbosity = fmap ae_verbosity askActEnv
+actVerbosity = fmap (shakeVerbosity . ae_options) askActEnv
 
 putStrLnAt :: Verbosity -> String -> Act n ()
 putStrLnAt at_verbosity msg = do
@@ -297,27 +322,22 @@ putStrLnAt at_verbosity msg = do
 -- NB: if you use shake in a nested way bad things will happen to parallelism
 -- TODO: make parallelism configurable?
 shake :: Namespace n => Shake n () -> IO ()
-shake mx = withPool numCapabilities $ \pool -> do
-    -- TODO: when we have more command line options, use a proper command line argument parser.
-    -- We should also work out whether shake should be doing argument parsing at all, given that it's
-    -- meant to be used as a library function...
-    verbosity <- fmap (\args -> fromMaybe NormalVerbosity $ listToMaybe $ reverse [ case rest of ""  -> VerboseVerbosity
-                                                                                                 "v" -> ChattyVerbosity
-                                                                                                 _   -> toEnum (fromEnum (minBound :: Verbosity) `max` read rest `min` fromEnum (maxBound :: Verbosity))
-                                                                                  | '-':'v':rest <- args ]) getArgs
-    
+shake = shakeWithOptions defaultShakeOptions
+
+shakeWithOptions :: Namespace n => ShakeOptions -> Shake n () -> IO ()
+shakeWithOptions opts mx = withPool (shakeThreads opts) $ \pool -> do
     mb_bs <- handleDoesNotExist (return Nothing) $ fmap Just $ BS.readFile ".openshake-db"
     db <- case mb_bs of
         Nothing -> do
-            when (verbosity >= NormalVerbosity) $ putStrLn "Database did not exist, doing full rebuild"
+            when (shakeVerbosity opts >= NormalVerbosity) $ putStrLn "Database did not exist, doing full rebuild"
             return M.empty
          -- NB: we force the input ByteString because we really want the database file to be closed promptly
         Just bs -> length (BS.unpack bs) `seq` (Exception.evaluate (rnf db) >> return db) `Exception.catch` \(Exception.ErrorCall reason) -> do
-            when (verbosity >= NormalVerbosity) $ putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
+            when (shakeVerbosity opts >= NormalVerbosity) $ putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
             return M.empty
           where db = runGetAll getPureDatabase bs
     
-    when (verbosity >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [show fp ++ ": " ++ show status | (fp, status) <- M.toList db]
+    when (shakeVerbosity opts >= ChattyVerbosity) $ putStr $ "Initial database:\n" ++ unlines [show fp ++ ": " ++ show status | (fp, status) <- M.toList db]
     db_mvar <- newMVar db
     
     wdb_mvar <- newMVar emptyWaitDatabase
@@ -326,12 +346,11 @@ shake mx = withPool numCapabilities $ \pool -> do
     -- Collect rules and wants, then execute the collected Act actions (in any order)
     let ((), final_s) = runShake (SE { se_available_rules = [ss_rules final_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
     parallel_ pool $ flip map (ss_acts final_s) $ \(act_rules, act) -> do
-        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_verbosity = verbosity }) (AS { as_this_history = [] }) act
+        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }) (AS { as_this_history = [] }) act
         return ()
     
-    -- TODO: put report under command-line control
     final_report <- takeMVar report_mvar
-    writeFile "openshake-report.html" (produceReport final_report)
+    traverse_ (\report_fp -> writeFile report_fp (produceReport final_report)) (shakeReport opts)
     
     final_db <- takeMVar db_mvar
     BS.writeFile ".openshake-db" (runPut $ putPureDatabase final_db)
@@ -503,7 +522,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                 return (fps', would_block_handles, db, second (second ((all_fps_satisfied_here, rule) :)))
     fmap res_transformer $ findAllRules e fps would_block_handles db
   where
-    verbosity = ae_verbosity e
+    verbosity = shakeVerbosity (ae_options e)
 
 need' :: Namespace n => ActEnv n -> [n] -> IO [Entry n]
 need' e init_fps = do
