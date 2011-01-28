@@ -152,21 +152,24 @@ type Generator' ntop n = ([n], Act ntop [Entry n])
 type Generator n = Generator' n n
 
 data ShakeOptions = ShakeOptions {
-    shakeVerbosity :: Verbosity,  -- ^ Verbosity of logging
-    shakeThreads :: Int,          -- ^ Number of simultaneous build actions to run
-    shakeReport :: Maybe FilePath -- ^ File to write build report to, if any
+    shakeVerbosity :: Verbosity,   -- ^ Verbosity of logging
+    shakeThreads :: Int,           -- ^ Number of simultaneous build actions to run
+    shakeReport :: Maybe FilePath, -- ^ File to write build report to, if any
+    shakeContinue :: Bool          -- ^ Attempt to build as much as possible, even if we get exceptions during building
   }
 
 defaultShakeOptions :: ShakeOptions
 defaultShakeOptions = ShakeOptions {
     shakeVerbosity = unsafePerformIO verbosity,
     shakeThreads = numCapabilities,
-    shakeReport = Just "openshake-report.html"
+    shakeReport = Just "openshake-report.html",
+    shakeContinue = unsafePerformIO continue
   }
   where
     -- TODO: when we have more command line options, use a proper command line argument parser.
     -- We should also work out whether shake should be doing argument parsing at all, given that it's
     -- meant to be used as a library function...
+    continue = fmap ("-k" `elem`) getArgs
     verbosity = fmap (\args -> fromMaybe NormalVerbosity $ listToMaybe $ reverse [ case rest of ""  -> VerboseVerbosity
                                                                                                 "v" -> ChattyVerbosity
                                                                                                 _   -> toEnum (fromEnum (minBound :: Verbosity) `max` read rest `min` fromEnum (maxBound :: Verbosity))
@@ -501,8 +504,10 @@ findAllRules e (fp:fps) would_block_handles db = do
                     rule = do
                         -- Report any standard IO errors as ShakefileExceptions so we can delay them until the end
                         -- At the same time, be careful not to wrap ShakefileExceptions from any nested needs.
-                        ei_sfe_result <- fmap (either (\e -> Left (ActionError (e :: Exception.SomeException))) id) $
-                                              Exception.try (Exception.try basic_rule)
+                        ei_sfe_result <- if shakeContinue (ae_options e)
+                                         then fmap (either (\e -> Left (ActionError (e :: Exception.SomeException))) id) $
+                                                   Exception.try (Exception.try basic_rule)
+                                         else fmap Right basic_rule
                         let (ei_sfe_mtimes, creates_statuses) = case ei_sfe_result of
                                -- Building the files succeeded, we should mark them as clean
                               Right (nested_hist, mtimes) -> (Right mtimes, map (Clean nested_hist) mtimes)
