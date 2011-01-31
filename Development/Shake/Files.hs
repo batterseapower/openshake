@@ -25,7 +25,6 @@ import Data.Binary
 
 import Control.DeepSeq
 
-import Control.Concurrent (threadDelay)
 import Control.Monad
 import Control.Monad.IO.Class
 
@@ -120,7 +119,6 @@ instance Namespace CanonicalFilePath where
     data Snapshot CanonicalFilePath = CFPSS (M.Map CanonicalFilePath ClockTime)
     
     takeSnapshot = do
-        threadDelay (500 * 1000) -- Half a second delay to deal with access time resolution issues
         cwd <- getCurrentDirectory >>= canonical
         (_, fps) <- explore cwd (S.empty, S.empty) "."
         liftM (CFPSS . M.fromAscList) $ forM (S.toAscList fps) $ \fp -> liftM (fp,) (getAccessTime (canonicalFilePath fp))
