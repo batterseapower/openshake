@@ -10,11 +10,11 @@ import Control.Monad.IO.Class
 main :: IO ()
 main = shake $ do
     "access-without-need" *> \x -> do
-        readFile "accessed-without-need"
+        liftIO $ readFile "accessed-without-need"
         system' ["touch", "access-without-need"]
     
     "access-before-need" *> \x -> do
-        readFile "accessed-before-need"
+        liftIO $ readFile "accessed-before-need"
         need ["accessed-before-need"]
         system' ["touch", "access-before-need"]
     
