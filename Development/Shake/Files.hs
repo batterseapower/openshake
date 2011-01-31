@@ -140,7 +140,7 @@ instance Namespace CanonicalFilePath where
         ss_accessed = M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
         
         -- 1) We must not be allowed to access/delete files that we didn't "need" or are building
-        accessed_no_need = filter (\(fp, reason) -> not $ fp `elem` (building_fps ++ needed_fps)) (map (,"deleted") (M.keys ss_deleted) ++ map (,"read or written to") (M.keys ss_accessed))
+        accessed_no_need = filter (\(fp, _reason) -> not $ fp `elem` (building_fps ++ needed_fps)) (map (,"deleted") (M.keys ss_deleted) ++ map (,"read or written to") (M.keys ss_accessed))
         -- 2) We should not "need" files that we didn't access
         -- FIXME: I shouldn't be doing this until the very last need..
         --needed_no_access = filter (\fp -> not $ fp `M.member` ss_accessed) fps
