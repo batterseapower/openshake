@@ -114,25 +114,42 @@ instance Namespace CanonicalFilePath where
             -- check will catch the change.
             Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
     
-    data Snapshot CanonicalFilePath = CFPSS (M.Map FilePath ClockTime)
+    data Snapshot CanonicalFilePath = CFPSS (M.Map CanonicalFilePath ClockTime)
     
     takeSnapshot = do
         cwd <- getCurrentDirectory
         fps <- explore S.empty cwd
-        liftM (CFPSS . M.fromAscList) $ forM (S.toAscList fps) $ \fp -> liftM (fp,) (getAccessTime fp)
+        liftM (CFPSS . M.fromAscList) $ forM (S.toAscList fps) $ \fp -> liftM (fp,) (getAccessTime (canonicalFilePath fp))
       where
         explore seen fp = do
-          fp <- canonicalizePath fp
+          fp <- canonical fp
           if fp `S.member` seen
            then return seen
            else do
             let seen' = S.insert fp seen
-            is_file <- doesFileExist fp
+            is_file <- doesFileExist (canonicalFilePath fp)
             if is_file
              then return seen'
-             else getDirectoryContents fp >>= (foldM explore seen' . map (fp </>))
+             else getDirectoryContents (canonicalFilePath fp) >>= (foldM explore seen' . map (canonicalFilePath fp </>))
 
-    compareSnapshots _fps (CFPSS _ss) (CFPSS _ss') = [] -- FIXME: actually do something useful
+    compareSnapshots fps (CFPSS ss) (CFPSS ss') = [show fp ++ " was accessed without 'need'ing it" | fp <- accessed_no_need]
+      where
+        (_ss_deleted, ss_continued, _ss_created) = zipMaps ss ss'
+        ss_accessed = M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
+        
+        -- 1) We should not be allowed to access files that we didn't "need"
+        accessed_no_need = M.keys $ M.filterWithKey (\fp _atimes -> not $ fp `elem` fps) ss_accessed
+        -- 2) We should not "need" files that we didn't access
+        -- FIXME: I shouldn't be doing this until the very last need..
+        --needed_no_access = filter (\fp -> not $ fp `M.member` ss_accessed) fps
+        -- 3) We should not create files there are rules for but are not in our "also" list
+        -- FIXME
+        -- 4) We should not delete files there are rules for
+        -- FIXME
+
+
+zipMaps :: Ord k => M.Map k v -> M.Map k v -> (M.Map k v, M.Map k (v, v), M.Map k v)
+zipMaps m1 m2 = (m1 `M.difference` m2, M.intersectionWith (,) m1 m2, m2 `M.difference` m1)
 
 
 type CreatesFiles = [FilePath]

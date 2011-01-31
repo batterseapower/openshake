@@ -200,4 +200,13 @@ main = do
         -- We should have managed to build one of the things needed even though everything else died
         doesFileExist "foo-dependency3" >>= assertEqualM True
 
+    withCurrentDirectory "lint" $ do
+        clean [".openshake-db", "access-without-need", "access-before-need", "need-without-access"]
+        
+        (ec, stderr) <- shake "Shakefile.hs" ["--lint"]
+        
+        -- All exceptions should be reported
+        ExitSuccess `assertEqualM` ec
+        (\x -> all (`isInfixOf` x) ["access-without-need was accessed without 'need'ing it", "access-before-need was accessed without 'need'ing it"]) `assertIsM` stderr
+
 \end{code}

@@ -163,7 +163,7 @@ data ShakeOptions = ShakeOptions {
     shakeThreads :: Int,           -- ^ Number of simultaneous build actions to run
     shakeReport :: Maybe FilePath, -- ^ File to write build report to, if any
     shakeContinue :: Bool,         -- ^ Attempt to build as much as possible, even if we get exceptions during building
-    shakeLint :: Bool
+    shakeLint :: Bool              -- ^ Run the build sequentially, sanity checking user rules at each step
   }
 
 defaultShakeOptions :: ShakeOptions
@@ -172,13 +172,14 @@ defaultShakeOptions = ShakeOptions {
     shakeThreads = numCapabilities,
     shakeReport = Just "openshake-report.html",
     shakeContinue = unsafePerformIO continue,
-    shakeLint = True -- FIXME
+    shakeLint = unsafePerformIO lint
   }
   where
     -- TODO: when we have more command line options, use a proper command line argument parser.
     -- We should also work out whether shake should be doing argument parsing at all, given that it's
     -- meant to be used as a library function...
     continue = fmap ("-k" `elem`) getArgs
+    lint = fmap ("--lint" `elem`) getArgs
     verbosity = fmap (\args -> fromMaybe NormalVerbosity $ listToMaybe $ reverse [ case rest of ""  -> VerboseVerbosity
                                                                                                 "v" -> ChattyVerbosity
                                                                                                 _   -> toEnum (fromEnum (minBound :: Verbosity) `max` read rest `min` fromEnum (maxBound :: Verbosity))
