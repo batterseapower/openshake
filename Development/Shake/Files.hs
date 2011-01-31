@@ -25,10 +25,13 @@ import Data.Binary
 
 import Control.DeepSeq
 
+import Control.Concurrent (threadDelay)
 import Control.Monad
 import Control.Monad.IO.Class
 
 import Data.Traversable (Traversable(traverse))
+
+import Data.List
 import qualified Data.Map as M
 import qualified Data.Set as S
 
@@ -37,6 +40,8 @@ import System.Directory.AccessTime
 import System.FilePath (takeDirectory, equalFilePath, makeRelative, (</>))
 import System.FilePath.Glob
 import System.Time (ClockTime(..))
+
+import Debug.Trace
 
 
 type ModTime = ClockTime
@@ -84,7 +89,7 @@ instance Binary CanonicalFilePath where
 
 canonical :: FilePath -> IO CanonicalFilePath
 canonical fp = do
-    exists <- doesFileExist fp
+    exists <- liftM2 (||) (doesFileExist fp) (doesDirectoryExist fp)
     if exists
       then fmap (UnsafeCanonicalise fp) $ canonicalizePath fp
       else fmap (UnsafeCanonicalise fp . (</> fp)) getCurrentDirectory
@@ -117,28 +122,29 @@ instance Namespace CanonicalFilePath where
     data Snapshot CanonicalFilePath = CFPSS (M.Map CanonicalFilePath ClockTime)
     
     takeSnapshot = do
-        cwd <- getCurrentDirectory
-        fps <- explore S.empty cwd
+        threadDelay (500 * 1000) -- Half a second delay to deal with access time resolution issues
+        cwd <- getCurrentDirectory >>= canonical
+        fps <- explore cwd S.empty "."
         liftM (CFPSS . M.fromAscList) $ forM (S.toAscList fps) $ \fp -> liftM (fp,) (getAccessTime (canonicalFilePath fp))
       where
-        explore seen fp = do
+        explore parent_fp seen fp = do
           fp <- canonical fp
-          if fp `S.member` seen
+          if fp `S.member` seen || not (canonicalFilePath parent_fp `isPrefixOf` canonicalFilePath fp) -- Must prevent explore following ".." downwards to the root file system!
            then return seen
            else do
             let seen' = S.insert fp seen
             is_file <- doesFileExist (canonicalFilePath fp)
             if is_file
              then return seen'
-             else getDirectoryContents (canonicalFilePath fp) >>= (foldM explore seen' . map (canonicalFilePath fp </>))
+             else getDirectoryContents (canonicalFilePath fp) >>= (foldM (explore fp) seen' . map (canonicalFilePath fp </>))
 
-    compareSnapshots fps (CFPSS ss) (CFPSS ss') = [show fp ++ " was accessed without 'need'ing it" | fp <- accessed_no_need]
+    compareSnapshots building_fps needed_fps (CFPSS ss) (CFPSS ss') = {- trace ("compareSnapshots " ++ show (ss, ss')) -} [show fp ++ " was accessed without 'need'ing it" | fp <- accessed_no_need]
       where
         (_ss_deleted, ss_continued, _ss_created) = zipMaps ss ss'
         ss_accessed = M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
         
-        -- 1) We should not be allowed to access files that we didn't "need"
-        accessed_no_need = M.keys $ M.filterWithKey (\fp _atimes -> not $ fp `elem` fps) ss_accessed
+        -- 1) We should not be allowed to access files that we didn't "need" or are building
+        accessed_no_need = M.keys $ M.filterWithKey (\fp _atimes -> not $ fp `elem` (building_fps ++ needed_fps)) ss_accessed
         -- 2) We should not "need" files that we didn't access
         -- FIXME: I shouldn't be doing this until the very last need..
         --needed_no_access = filter (\fp -> not $ fp `M.member` ss_accessed) fps

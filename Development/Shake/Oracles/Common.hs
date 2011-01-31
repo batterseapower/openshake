@@ -42,7 +42,7 @@ instance Oracle o => Namespace (Question o) where
     data Snapshot (Question o) = OracleSnapshot -- Nothing to sanity check: how could we tell if user code had used the result of a query?
     
     takeSnapshot = return OracleSnapshot
-    compareSnapshots _ OracleSnapshot OracleSnapshot = []
+    compareSnapshots _ _ OracleSnapshot OracleSnapshot = []
 
 
 oracleRule :: Oracle o => o -> Question o -> IO (Maybe ([Question o], Act ntop [Answer o]))

@@ -99,7 +99,12 @@ instance (Namespace n1, Namespace n2) => Namespace (n1 :+: n2) where
     data Snapshot (n1 :+: n2) = UnionSnapshot (Snapshot n1) (Snapshot n2)
     
     takeSnapshot = liftM2 UnionSnapshot takeSnapshot takeSnapshot
-    compareSnapshots ns (UnionSnapshot ss1 ss2) (UnionSnapshot ss1' ss2') = compareSnapshots [n1 | LeftName n1 <- ns] ss1 ss1' ++ compareSnapshots [n2 | RightName n2 <- ns] ss2 ss2'
+    compareSnapshots building_ns ns (UnionSnapshot ss1 ss2) (UnionSnapshot ss1' ss2') = compareSnapshots building_ns1 ns1 ss1 ss1' ++ compareSnapshots building_ns2 ns2 ss2 ss2'
+      where (ns1, ns2) = partitionNames ns
+            (building_ns1, building_ns2) = partitionNames building_ns
+
+partitionNames :: [n1 :+: n2] -> ([n1], [n2])
+partitionNames ns = ([n1 | LeftName n1 <- ns], [n2 | RightName n2 <- ns])
 
 
 -- | It is occasionally useful to have a "unit" namespace that is a subtype of everything. There are no (non-bottom) names of this type.
@@ -119,7 +124,7 @@ instance Namespace Empty where
     type Entry Empty = Empty
     data Snapshot Empty = EmptySnapshot
     takeSnapshot = return EmptySnapshot
-    compareSnapshots _ EmptySnapshot EmptySnapshot = []
+    compareSnapshots _ _ EmptySnapshot EmptySnapshot = []
 
 
 liftRule :: (nsub :< nsup) => Rule' ntop nsub -> Rule' ntop nsup

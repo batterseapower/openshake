@@ -144,7 +144,7 @@ class (Ord n, Eq (Entry n),
 
     takeSnapshot :: IO (Snapshot n)
 
-    compareSnapshots :: [n] -> Snapshot n -> Snapshot n -> [String]
+    compareSnapshots :: [n] -> [n] -> Snapshot n -> Snapshot n -> [String]
 
 
 type Rule' ntop n = n -> IO (Maybe (Generator' ntop n))
@@ -297,6 +297,7 @@ data ActState n = AS {
 data ActEnv n = AE {
     ae_would_block_handles :: [WaitHandle ()], -- ^ A list of handles that would be incapable of awakening if the action were to
                                                --   block indefinitely here and now. This is used in the deadlock detector.
+    ae_building :: [n],
     ae_rules :: [[RuleClosure n]],
     ae_database :: Database n,
     ae_wait_database :: MVar (WaitDatabase n),
@@ -333,7 +334,7 @@ putStrLnAt at_verbosity msg = do
     liftIO $ when (verbosity >= at_verbosity) $ putStrLn msg
 
 liftLint :: Lint n a -> Act n a
-liftLint lint = Act $ Reader.ReaderT $ \_e -> State.StateT $ \s -> State.runStateT (Reader.runReaderT (unLint lint) [n | Need nes <- as_this_history s, (n, _e) <- nes]) (as_snapshot s) >>= \(x, mb_ss) -> return (x, s { as_snapshot = mb_ss })
+liftLint lint = Act $ Reader.ReaderT $ \e -> State.StateT $ \s -> State.runStateT (Reader.runReaderT (unLint lint) (ae_building e, [n | Need nes <- as_this_history s, (n, _e) <- nes])) (as_snapshot s) >>= \(x, mb_ss) -> return (x, s { as_snapshot = mb_ss })
 
 
 -- NB: if you use shake in a nested way bad things will happen to parallelism
@@ -365,7 +366,7 @@ shakeWithOptions opts mx = withPool (shakeThreads opts) $ \pool -> do
     -- Collect rules and wants, then execute the collected Act actions (in any order)
     let ((), complete_s) = runShake (SE { se_available_rules = [ss_rules complete_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
     _ <- flip State.runStateT mb_ss $ parallelLint' pool $ flip map (ss_acts complete_s) $ \(act_rules, act) -> State.StateT $ \mb_ss -> do
-        ((), final_s) <- runAct (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }) (AS { as_this_history = [], as_snapshot = mb_ss }) act
+        ((), final_s) <- runAct (AE { ae_building = [], ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }) (AS { as_this_history = [], as_snapshot = mb_ss }) act
         return ((), as_snapshot final_s)
     
     final_report <- takeMVar report_mvar
@@ -411,7 +412,7 @@ doesQARequireRerun need (Need nested_fps_times) = do
         \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
 
-newtype Lint n a = Lint { unLint :: Reader.ReaderT [n] (Lint' n) a } -- If the Snapshot is empty, we aren't linting
+newtype Lint n a = Lint { unLint :: Reader.ReaderT ([n], [n]) (Lint' n) a } -- If the Snapshot is empty, we aren't linting
                  deriving (Functor, Applicative, Monad, MonadIO, MonadPeelIO)
 
 type Lint' n = State.StateT (Maybe (Snapshot n)) IO
@@ -518,7 +519,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                   Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
                   Right dirty_reason -> do
                     when (verbosity >= ChattyVerbosity) $ liftIO $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
-                    return (potential_creates_fps, potential_rule (\rules -> e { ae_rules = rules, ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
+                    return (potential_creates_fps, potential_rule (\rules building -> e { ae_building = building, ae_rules = rules, ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
             
                 let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
                     -- What we should do is remove from the remaning uncleans any files that are created by the rule we just added
@@ -754,7 +755,7 @@ appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_hi
 
 findRule :: Namespace n
          => Verbosity -> [[RuleClosure n]] -> n
-         -> IO ([n], ([[RuleClosure n]] -> ActEnv n) -> Lint' n (History n, [Entry n]))
+         -> IO ([n], ([[RuleClosure n]] -> [n] -> ActEnv n) -> Lint' n (History n, [Entry n]))
 findRule verbosity ruless fp = do
     possibilities <- flip mapMaybeM ruless $ \rules -> do
         generators <- mapMaybeM (\rc -> liftM (fmap ((,) (rc_closure rc))) $ rc_rule rc fp) rules
@@ -774,13 +775,13 @@ findRule verbosity ruless fp = do
 
     return (creates_fps, \mk_e -> State.StateT $ \mb_ss -> do
         -- Lint the IO stuff that the rule did in between its last invocation of need (if any) and returning
-        (creates_times, final_nested_s) <- runAct (mk_e clo_rules) (AS { as_this_history = [], as_snapshot = mb_ss }) (action `tap_` liftLint retakeSnapshot)
+        (creates_times, final_nested_s) <- runAct (mk_e clo_rules creates_fps) (AS { as_this_history = [], as_snapshot = mb_ss }) (action `tap_` liftLint retakeSnapshot)
         return ((as_this_history final_nested_s, creates_times), as_snapshot final_nested_s))
 
 retakeSnapshot :: Namespace n => Lint n ()
-retakeSnapshot = Lint $ Reader.ReaderT $ \ns -> State.StateT $ \mb_ss -> case mb_ss of Nothing -> return ((), Nothing)
-                                                                                       Just ss -> do
-                                                                                         ss' <- takeSnapshot
-                                                                                         -- FIXME: accumulate errors
-                                                                                         mapM_ putStrLn $ compareSnapshots ns ss ss'
-                                                                                         return ((), Just ss')
+retakeSnapshot = Lint $ Reader.ReaderT $ \(building_ns, ns) -> State.StateT $ \mb_ss -> case mb_ss of Nothing -> return ((), Nothing)
+                                                                                                      Just ss -> do
+                                                                                                        ss' <- takeSnapshot
+                                                                                                        -- FIXME: accumulate errors
+                                                                                                        mapM_ putStrLn $ compareSnapshots building_ns ns ss ss'
+                                                                                                        return ((), Just ss')
