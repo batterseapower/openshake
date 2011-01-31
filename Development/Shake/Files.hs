@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, GeneralizedNewtypeDeriving, FlexibleContexts #-}
+{-# LANGUAGE TypeFamilies, GeneralizedNewtypeDeriving, FlexibleContexts, TupleSections #-}
 module Development.Shake.Files (
     -- * File modification times
     ModTime, getFileModTime,
@@ -29,8 +29,11 @@ import Control.Monad
 import Control.Monad.IO.Class
 
 import Data.Traversable (Traversable(traverse))
+import qualified Data.Map as M
+import qualified Data.Set as S
 
 import System.Directory
+import System.Directory.AccessTime
 import System.FilePath (takeDirectory, equalFilePath, makeRelative, (</>))
 import System.FilePath.Glob
 import System.Time (ClockTime(..))
@@ -111,10 +114,25 @@ instance Namespace CanonicalFilePath where
             -- check will catch the change.
             Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
     
-    data Snapshot CanonicalFilePath = CFPSnapshot
+    data Snapshot CanonicalFilePath = CFPSS (M.Map FilePath ClockTime)
     
-    takeSnapshot = return CFPSnapshot
-    compareSnapshots _fps CFPSnapshot CFPSnapshot = [] -- FIXME: actually do something useful
+    takeSnapshot = do
+        cwd <- getCurrentDirectory
+        fps <- explore S.empty cwd
+        liftM (CFPSS . M.fromAscList) $ forM (S.toAscList fps) $ \fp -> liftM (fp,) (getAccessTime fp)
+      where
+        explore seen fp = do
+          fp <- canonicalizePath fp
+          if fp `S.member` seen
+           then return seen
+           else do
+            let seen' = S.insert fp seen
+            is_file <- doesFileExist fp
+            if is_file
+             then return seen'
+             else getDirectoryContents fp >>= (foldM explore seen' . map (fp </>))
+
+    compareSnapshots _fps (CFPSS _ss) (CFPSS _ss') = [] -- FIXME: actually do something useful
 
 
 type CreatesFiles = [FilePath]
