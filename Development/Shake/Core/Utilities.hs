@@ -116,6 +116,9 @@ listExtractors = head : map (. tail) listExtractors
 True  ? (t, _) = t
 False ? (_, f) = f
 
+swap :: (a, b) -> (b, a)
+swap (x, y) = (y, x)
+
 
 checkExitCode :: (Show a, Monad m) => a -> ExitCode -> m ()
 checkExitCode cmd ec = case ec of

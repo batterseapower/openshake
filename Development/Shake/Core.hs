@@ -50,13 +50,14 @@ import Control.Concurrent.MVar
 import Control.Concurrent.ParallelIO.Local
 
 import Control.DeepSeq
-import qualified Control.Exception as Exception
+import qualified Control.Exception.Peel as Exception
 
 import Control.Monad
 import qualified Control.Monad.Trans.Reader as Reader
 import qualified Control.Monad.Trans.State as State
 import Control.Monad.Trans.Class (MonadTrans(..))
 import Control.Monad.IO.Class
+import Control.Monad.IO.Peel
 
 -- import Data.Set (Set)
 -- import qualified Data.Set as S
@@ -139,6 +140,12 @@ class (Ord n, Eq (Entry n),
     defaultRule :: Rule' ntop n
     defaultRule _ = return Nothing
 
+    data Snapshot n
+
+    takeSnapshot :: IO (Snapshot n)
+
+    compareSnapshots :: [n] -> Snapshot n -> Snapshot n -> [String]
+
 
 type Rule' ntop n = n -> IO (Maybe (Generator' ntop n))
 type Rule n = Rule' n n
@@ -155,7 +162,8 @@ data ShakeOptions = ShakeOptions {
     shakeVerbosity :: Verbosity,   -- ^ Verbosity of logging
     shakeThreads :: Int,           -- ^ Number of simultaneous build actions to run
     shakeReport :: Maybe FilePath, -- ^ File to write build report to, if any
-    shakeContinue :: Bool          -- ^ Attempt to build as much as possible, even if we get exceptions during building
+    shakeContinue :: Bool,         -- ^ Attempt to build as much as possible, even if we get exceptions during building
+    shakeLint :: Bool
   }
 
 defaultShakeOptions :: ShakeOptions
@@ -163,7 +171,8 @@ defaultShakeOptions = ShakeOptions {
     shakeVerbosity = unsafePerformIO verbosity,
     shakeThreads = numCapabilities,
     shakeReport = Just "openshake-report.html",
-    shakeContinue = unsafePerformIO continue
+    shakeContinue = unsafePerformIO continue,
+    shakeLint = True -- FIXME
   }
   where
     -- TODO: when we have more command line options, use a proper command line argument parser.
@@ -280,7 +289,8 @@ instance Namespace n => Binary (QA n) where
     put (Need xes) = putList (\(fp, mtime) -> put fp >> put mtime) xes
 
 data ActState n = AS {
-    as_this_history :: History n
+    as_this_history :: History n,
+    as_snapshot :: Maybe (Snapshot n)
   }
 
 data ActEnv n = AE {
@@ -296,7 +306,7 @@ data ActEnv n = AE {
 
 
 newtype Act n a = Act { unAct :: Reader.ReaderT (ActEnv n) (State.StateT (ActState n) IO) a }
-              deriving (Functor, Applicative, Monad, MonadIO)
+              deriving (Functor, Applicative, Monad, MonadIO, MonadPeelIO)
 
 runAct :: ActEnv n -> ActState n -> Act n a -> IO (a, ActState n)
 runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
@@ -320,6 +330,9 @@ putStrLnAt :: Verbosity -> String -> Act n ()
 putStrLnAt at_verbosity msg = do
     verbosity <- actVerbosity
     liftIO $ when (verbosity >= at_verbosity) $ putStrLn msg
+
+liftLint :: Lint n a -> Act n a
+liftLint lint = Act $ Reader.ReaderT $ \_e -> State.StateT $ \s -> State.runStateT (Reader.runReaderT (unLint lint) [n | Need nes <- as_this_history s, (n, _e) <- nes]) (as_snapshot s) >>= \(x, mb_ss) -> return (x, s { as_snapshot = mb_ss })
 
 
 -- NB: if you use shake in a nested way bad things will happen to parallelism
@@ -346,11 +359,13 @@ shakeWithOptions opts mx = withPool (shakeThreads opts) $ \pool -> do
     wdb_mvar <- newMVar emptyWaitDatabase
     report_mvar <- emptyReportDatabase >>= newMVar
 
+    mb_ss <- if shakeLint opts then fmap Just takeSnapshot else return Nothing
+
     -- Collect rules and wants, then execute the collected Act actions (in any order)
-    let ((), final_s) = runShake (SE { se_available_rules = [ss_rules final_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
-    parallel_ pool $ flip map (ss_acts final_s) $ \(act_rules, act) -> do
-        ((), _final_s) <- runAct (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }) (AS { as_this_history = [] }) act
-        return ()
+    let ((), complete_s) = runShake (SE { se_available_rules = [ss_rules complete_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
+    _ <- flip State.runStateT mb_ss $ parallelSS pool $ flip map (ss_acts complete_s) $ \(act_rules, act) -> State.StateT $ \mb_ss -> do
+        ((), final_s) <- runAct (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }) (AS { as_this_history = [], as_snapshot = mb_ss }) act
+        return ((), as_snapshot final_s)
     
     final_report <- takeMVar report_mvar
     traverse_ (\report_fp -> writeFile report_fp (produceReport final_report)) (shakeReport opts)
@@ -375,17 +390,17 @@ addRule rule = do
 need :: Namespace n => [n] -> Act n [Entry n]
 need fps = do
     e <- askActEnv
-    need_times <- liftIO $ need' e fps
+    need_times <- liftLint $ need' e fps
     appendHistory $ Need (fps `zip` need_times)
     return need_times
 
-withoutMVar :: MVar a -> a -> IO b -> IO (a, b)
-withoutMVar mvar x act = putMVar mvar x >> act >>= \y -> takeMVar mvar >>= \x' -> return (x', y)
+withoutMVar :: MonadIO m => MVar a -> a -> m b -> m (a, b)
+withoutMVar mvar x act = liftIO (putMVar mvar x) >> act >>= \y -> liftIO (takeMVar mvar) >>= \x' -> return (x', y)
 
 -- We assume that the rules do not change to include new dependencies often: this lets
 -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
 -- of the rule have not changed
-doesQARequireRerun :: Namespace n => ([n] -> IO [Entry n]) -> QA n -> IO (Maybe String)
+doesQARequireRerun :: Namespace n => ([n] -> Lint n [Entry n]) -> QA n -> Lint n (Maybe String)
 doesQARequireRerun need (Need nested_fps_times) = do
     let (nested_fps, nested_old_times) = unzip nested_fps_times
     -- NB: if this Need is for a generated file we have to build it again if any of the things *it* needs have changed,
@@ -394,14 +409,29 @@ doesQARequireRerun need (Need nested_fps_times) = do
     return $ firstJust $ (\f -> zipWith3 f nested_fps nested_new_times nested_old_times) $
         \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
+
+newtype Lint n a = Lint { unLint :: Reader.ReaderT [n] Lint' a } -- If the Snapshot is empty, we aren't linting
+                 deriving (Functor, Applicative, Monad, MonadIO, MonadPeelIO)
+
+type Lint' n = State.StateT (Maybe (Snapshot n)) IO
+
+-- If in non-linting mode, run actions in parallel. Otherwise, run them sequentially,
+-- validating the changes made at every step
+parallelLint :: Pool -> [Lint n a] -> Lint n [a]
+parallelLint pool lints = Lint $ Reader.ReaderT $ \e -> parallelLint' pool [Reader.runReaderT (unLint lint) e | lint <- lints]
+
+parallelLint' :: Pool -> [Lint' n a] -> Lint' n [a]
+parallelLint' pool acts = State.StateT $ \mb_s -> case mb_s of Nothing -> liftM (,Nothing) $ parallel pool $ map (\act -> liftM fst $ State.runStateT act Nothing) acts
+                                                            Just s  -> State.runStateT (sequence acts) (Just s)
+
 findAllRules :: Namespace n
              => ActEnv n
              -> [n]             -- ^ The files that we wish to find rules for
              -> [WaitHandle ()] -- ^ Handles that would be blocked if we blocked the thread right now
              -> PureDatabase n
-             -> IO (PureDatabase n,
-                    ([(n,   IO (Either ShakefileException (Entry n)))],  -- Action that just waits for a build in progress elsewhere to complete
-                     [([n], IO (Either ShakefileException [Entry n]))])) -- Action that creates (possibly several) of the files we asked for by invoking a user rule
+             -> Lint n (PureDatabase n,
+                        ([(n,   Lint' n (Either ShakefileException (Entry n)))],  -- Action that just waits for a build in progress elsewhere to complete
+                         [([n], Lint' n (Either ShakefileException [Entry n]))])) -- Action that creates (possibly several) of the files we asked for by invoking a user rule
 findAllRules _ []       _                   db = return (db, ([], []))
 findAllRules e (fp:fps) would_block_handles db = do
     (fps, would_block_handles, db, res_transformer) <- do
@@ -413,7 +443,7 @@ findAllRules e (fp:fps) would_block_handles db = do
              -- We've previously discovered the file to be clean: return an action that just returns the computed entry directly
             Just (Clean _ mtime)        -> Right $ return (Right mtime)
              -- Someone else is in the process of making the file clean. Return an action that wait on the wait handle for it to complete
-            Just (Building _ wait_mvar) -> Right $ do
+            Just (Building _ wait_mvar) -> Right $ liftIO $ do
               -- We can avoid a lot of fuss if the wait handle is already triggered, so there can be no waiting.
               -- This is purely a performance optimisation:
               may_wait <- mayWaitOnWaitHandle wait_mvar
@@ -432,7 +462,7 @@ findAllRules e (fp:fps) would_block_handles db = do
              -- 0) The artifact is *probably* going to be rebuilt, though we might still be able to skip a rebuild
              -- if a check of its history reveals that we don't need to. Get the rule we would use to do the rebuild.
              -- If this throws an exception, it is the fault of the **caller** of need so DON'T catch it
-            (potential_creates_fps, potential_rule) <- findRule verbosity (ae_rules e) fp
+            (potential_creates_fps, potential_rule) <- liftIO $ findRule verbosity (ae_rules e) fp
             
             let ei_why_rule_insane_unit = do
                     -- 1) Basic sanity check that the rule creates the file we actually need
@@ -462,7 +492,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                 --
                 -- NB: people wanting *any* of the files created by this rule should wait on the same BuildingWaitHandle.
                 -- However, we fmap each instance of it so that it only reports the Entry information for exactly the file you care about.
-                (wait_handle, awake_waiters) <- newWaitHandle
+                (wait_handle, awake_waiters) <- liftIO newWaitHandle
                 db <- return $ foldr (\(potential_creates_fp, extractor) db -> M.insert potential_creates_fp (Building mb_hist (fmap (liftM extractor) wait_handle)) db) db (potential_creates_fps `zip` listExtractors)
             
                 -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
@@ -478,7 +508,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                                                                           -- has changed since we last looked at it even though its dependent files haven't changed.
                                                                           -- This usually indicates some sort of bad thing has happened (e.g. editing a generated file) --
                                                                           -- we just rebuild it directly, though we could make another choice:
-                                                                          mb_insane_reason <- sanityCheck fp mtime
+                                                                          mb_insane_reason <- liftIO $ sanityCheck fp mtime
                                                                           return $ maybe (Left (hist, mtime)) Right mb_insane_reason
             
                 -- Each rule we execute will block the creation of some files if it waits:
@@ -490,7 +520,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                 (creates_fps, basic_rule) <- case ei_clean_hist_dirty_reason of
                   Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
                   Right dirty_reason -> do
-                    when (verbosity >= ChattyVerbosity) $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
+                    when (verbosity >= ChattyVerbosity) $ liftIO $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
                     return (potential_creates_fps, potential_rule (\rules -> e { ae_rules = rules, ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
             
                 let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
@@ -508,42 +538,47 @@ findAllRules e (fp:fps) would_block_handles db = do
                                          then fmap (either (\e -> Left (ActionError (e :: Exception.SomeException))) id) $
                                                    Exception.try (Exception.try basic_rule)
                                          else fmap Right basic_rule
-                        let (ei_sfe_mtimes, creates_statuses) = case ei_sfe_result of
-                               -- Building the files succeeded, we should mark them as clean
-                              Right (nested_hist, mtimes) -> (Right mtimes, map (Clean nested_hist) mtimes)
-                               -- Building the files failed, so we need to mark it as such
-                              Left sfe -> (Left sfe, repeat (Failed sfe))
-                        -- This is where we mark all of the files created by the rule as Clean/Failed:
-                        updateStatus (ae_database e) (creates_fps `zip` creates_statuses)
-                        -- Wake up all of the waiters on the old Building entry (if any)
-                        awake_waiters ei_sfe_mtimes
-                        -- Trim unnecessary modification times before we continue
-                        return $ fmap (\mtimes -> fromRight (\fp -> internalError $ "A pending unclean rule did not create the file " ++ show fp ++ " that we thought it did") $ lookupMany all_fps_satisfied_here (creates_fps `zip` mtimes)) ei_sfe_mtimes
+                        -- Everything else does not need to be monitored by the linter
+                        liftIO $ do
+                            let (ei_sfe_mtimes, creates_statuses) = case ei_sfe_result of
+                                   -- Building the files succeeded, we should mark them as clean
+                                  Right (nested_hist, mtimes) -> (Right mtimes, map (Clean nested_hist) mtimes)
+                                   -- Building the files failed, so we need to mark it as such
+                                  Left sfe -> (Left sfe, repeat (Failed sfe))
+                            -- This is where we mark all of the files created by the rule as Clean/Failed:
+                            updateStatus (ae_database e) (creates_fps `zip` creates_statuses)
+                            -- Wake up all of the waiters on the old Building entry (if any)
+                            awake_waiters ei_sfe_mtimes
+                            -- Trim unnecessary modification times before we continue
+                            return $ fmap (\mtimes -> fromRight (\fp -> internalError $ "A pending unclean rule did not create the file " ++ show fp ++ " that we thought it did") $ lookupMany all_fps_satisfied_here (creates_fps `zip` mtimes)) ei_sfe_mtimes
             
                 -- Display a helpful message to the user explaining the rules that we have decided upon:
                 when (verbosity >= ChattyVerbosity) $
-                    putStrLn $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show all_fps_satisfied_here)
+                    liftIO $ putStrLn $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show all_fps_satisfied_here)
             
                 return (fps', would_block_handles, db, second (second ((all_fps_satisfied_here, rule) :)))
     fmap res_transformer $ findAllRules e fps would_block_handles db
   where
     verbosity = shakeVerbosity (ae_options e)
 
-need' :: Namespace n => ActEnv n -> [n] -> IO [Entry n]
+modifyMVarLint :: MVar a -> (a -> Lint n (a, b)) -> Lint n b
+modifyMVarLint mvar f = Lint $ Reader.ReaderT $ \e -> State.StateT $ \s -> modifyMVar mvar (\x -> liftM (\((a, b), s) -> (a, (b, s))) $ State.runStateT (Reader.runReaderT (unLint (f x)) e) s)
+
+need' :: Namespace n => ActEnv n -> [n] -> Lint n [Entry n]
 need' e init_fps = do
     -- Figure out the rules we need to use to create all the dirty files we need
     --
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff).
     -- When we have to recursively invoke need, we put back into the MVar before doing so.
-    (cleans, uncleans) <- modifyMVar (ae_database e) $ findAllRules e init_fps []
+    (cleans, uncleans) <- modifyMVarLint (ae_database e) $ findAllRules e init_fps []
     
     -- Run the rules we have decided upon in parallel
     --
     -- NB: we report that the thread using parallel is blocked because it may go on to actually
     -- execute one of the parallel actions, which will bump the parallelism count without any
     -- extra parallelism actually occuring.
-    unclean_times <- reportWorkerBlocked (ae_report e) $ parallel (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ liftM (fmapEither (map show unclean_fps,) (unclean_fps `zip`)) rule
+    unclean_times <- reportWorkerBlocked (ae_report e) $ parallelLint (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ liftM (fmapEither (map show unclean_fps,) (unclean_fps `zip`)) rule
 
     -- For things that are being built by someone else we only do trivial work, so don't have to spawn any thread
     clean_times <- forM cleans $ \(clean_fp, rule) -> liftM (fmapEither ([show clean_fp],) (\mtime -> [(clean_fp, mtime)])) rule
@@ -554,7 +589,7 @@ need' e init_fps = do
     
     if null failures
      then return reordered_times
-     else Exception.throwIO $ RecursiveError failures
+     else liftIO $ Exception.throwIO $ RecursiveError failures
 
 -- | Just a unique number to identify each update we make to the 'WaitDatabase'
 type WaitNumber = Int
@@ -647,12 +682,12 @@ emptyReportDatabase = do
         rdb_start_at = ts
       }
 
-reportWorkerBlocked, reportWorkerRunning :: MVar ReportDatabase -> IO a -> IO a
+reportWorkerBlocked, reportWorkerRunning :: MonadPeelIO m => MVar ReportDatabase -> m a -> m a
 reportWorkerBlocked = reportConcurrencyBump (-1)
 reportWorkerRunning = reportConcurrencyBump 1
 
-reportConcurrencyBump :: Int -> MVar ReportDatabase -> IO a -> IO a
-reportConcurrencyBump bump mvar_rdb act = Exception.bracket (bump_concurrency bump) (\() -> bump_concurrency (negate bump)) (\() -> act)
+reportConcurrencyBump :: MonadPeelIO m => Int -> MVar ReportDatabase -> m a -> m a
+reportConcurrencyBump bump mvar_rdb act = Exception.bracket (liftIO $ bump_concurrency bump) (\() -> liftIO $ bump_concurrency (negate bump)) (\() -> act)
   where bump_concurrency directed_bump = modifyMVar_ mvar_rdb $ \rdb -> getCurrentTime >>= \ts -> return $ rdb { rdb_concurrency = rdb_concurrency rdb + directed_bump, rdb_observed_concurrency = (ts, rdb_concurrency rdb - directed_bump) : rdb_observed_concurrency rdb }
 
 reportCommand :: String -> IO a -> Act n a
@@ -718,7 +753,7 @@ appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_hi
 
 findRule :: Namespace n
          => Verbosity -> [[RuleClosure n]] -> n
-         -> IO ([n], ([[RuleClosure n]] -> ActEnv n) -> (IO (History n, [Entry n])))
+         -> IO ([n], ([[RuleClosure n]] -> ActEnv n) -> Lint' (History n, [Entry n]))
 findRule verbosity ruless fp = do
     possibilities <- flip mapMaybeM ruless $ \rules -> do
         generators <- mapMaybeM (\rc -> liftM (fmap ((,) (rc_closure rc))) $ rc_rule rc fp) rules
@@ -736,6 +771,10 @@ findRule verbosity ruless fp = do
             Nothing        -> shakefileError $ "No rule to build " ++ show fp
             Just generator -> return $ ([], generator) -- TODO: generalise to allow default rules to refer to others?
 
-    return (creates_fps, \mk_e -> do
-        (creates_times, final_nested_s) <- runAct (mk_e clo_rules) (AS { as_this_history = [] }) action
-        return (as_this_history final_nested_s, creates_times))
+    return (creates_fps, \mk_e -> State.StateT $ \mb_ss -> do
+        (creates_times, final_nested_s) <- runAct (mk_e clo_rules) (AS { as_this_history = [], as_snapshot = mb_ss }) action
+        case (mb_ss, as_snapshot final_nested_s) of 
+            -- FIXME: accumulate lint errors
+          (Just ss, Just ss') -> mapM_ putStrLn $ compareSnapshots e ss ss'
+          _ -> return ()
+        return ((as_this_history final_nested_s, creates_times), as_snapshot final_nested_s))
