@@ -41,8 +41,6 @@ import System.FilePath (takeDirectory, equalFilePath, makeRelative, (</>))
 import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
-import Debug.Trace
-
 
 type ModTime = ClockTime
 
@@ -124,21 +122,21 @@ instance Namespace CanonicalFilePath where
     takeSnapshot = do
         threadDelay (500 * 1000) -- Half a second delay to deal with access time resolution issues
         cwd <- getCurrentDirectory >>= canonical
-        fps <- explore cwd S.empty "."
+        (_, fps) <- explore cwd (S.empty, S.empty) "."
         liftM (CFPSS . M.fromAscList) $ forM (S.toAscList fps) $ \fp -> liftM (fp,) (getAccessTime (canonicalFilePath fp))
       where
-        explore parent_fp seen fp = do
+        explore parent_fp (seen, seen_files) fp = do
           fp <- canonical fp
           if fp `S.member` seen || not (canonicalFilePath parent_fp `isPrefixOf` canonicalFilePath fp) -- Must prevent explore following ".." downwards to the root file system!
-           then return seen
+           then return (seen, seen_files)
            else do
             let seen' = S.insert fp seen
             is_file <- doesFileExist (canonicalFilePath fp)
             if is_file
-             then return seen'
-             else getDirectoryContents (canonicalFilePath fp) >>= (foldM (explore fp) seen' . map (canonicalFilePath fp </>))
+             then return (seen', S.insert fp seen_files)
+             else getDirectoryContents (canonicalFilePath fp) >>= (foldM (explore fp) (seen', seen_files) . map (originalFilePath fp </>))
 
-    compareSnapshots building_fps needed_fps (CFPSS ss) (CFPSS ss') = {- trace ("compareSnapshots " ++ show (ss, ss')) -} [show fp ++ " was accessed without 'need'ing it" | fp <- accessed_no_need]
+    compareSnapshots building_fps needed_fps (CFPSS ss) (CFPSS ss') = [show fp ++ " was accessed without 'need'ing it" | fp <- accessed_no_need]
       where
         (_ss_deleted, ss_continued, _ss_created) = zipMaps ss ss'
         ss_accessed = M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
