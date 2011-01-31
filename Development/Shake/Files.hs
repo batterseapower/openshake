@@ -136,19 +136,19 @@ instance Namespace CanonicalFilePath where
              then return (seen', S.insert fp seen_files)
              else getDirectoryContents (canonicalFilePath fp) >>= (foldM (explore fp) (seen', seen_files) . map (originalFilePath fp </>))
 
-    compareSnapshots building_fps needed_fps (CFPSS ss) (CFPSS ss') = [show fp ++ " was accessed without 'need'ing it" | fp <- accessed_no_need]
+    compareSnapshots building_fps needed_fps (CFPSS ss) (CFPSS ss') = [show fp ++ " was " ++ reason ++ " without 'need'ing it" | (fp, reason) <- accessed_no_need]
       where
-        (_ss_deleted, ss_continued, _ss_created) = zipMaps ss ss'
+        (ss_deleted, ss_continued, _ss_created) = zipMaps ss ss'
         ss_accessed = M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
         
-        -- 1) We should not be allowed to access files that we didn't "need" or are building
-        accessed_no_need = M.keys $ M.filterWithKey (\fp _atimes -> not $ fp `elem` (building_fps ++ needed_fps)) ss_accessed
+        -- 1) We must not be allowed to access/delete files that we didn't "need" or are building
+        accessed_no_need = filter (\(fp, reason) -> not $ fp `elem` (building_fps ++ needed_fps)) (map (,"deleted") (M.keys ss_deleted) ++ map (,"read or written to") (M.keys ss_accessed))
         -- 2) We should not "need" files that we didn't access
         -- FIXME: I shouldn't be doing this until the very last need..
         --needed_no_access = filter (\fp -> not $ fp `M.member` ss_accessed) fps
-        -- 3) We should not create files there are rules for but are not in our "also" list
+        -- 3) We must not create files there are rules for but are not in our "also" list
         -- FIXME
-        -- 4) We should not delete files there are rules for
+        -- 4) We should not delete files there are rules for, even if we previously "need"ed them
         -- FIXME
 
 
