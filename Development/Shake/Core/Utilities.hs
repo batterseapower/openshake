@@ -109,6 +109,12 @@ mapMaybeM f = go
             Nothing ->             go xs
             Just y  -> liftM (y:) (go xs)
 
+tap_ :: Monad m => m a -> m () -> m a
+tap_ mx mtap = tap mx (const mtap)
+
+tap :: Monad m => m a -> (a -> m ()) -> m a
+tap mx mtap = mx >>= \x -> mtap x >> return x
+
 listExtractors :: [[a] -> a]
 listExtractors = head : map (. tail) listExtractors
 

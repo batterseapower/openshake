@@ -110,6 +110,11 @@ instance Namespace CanonicalFilePath where
             -- but the file still exists. In that case we will try to recheck the old oracle answers against our new oracle and the type
             -- check will catch the change.
             Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
+    
+    data Snapshot CanonicalFilePath = CFPSnapshot
+    
+    takeSnapshot = return CFPSnapshot
+    compareSnapshots _fps CFPSnapshot CFPSnapshot = [] -- FIXME: actually do something useful
 
 
 type CreatesFiles = [FilePath]

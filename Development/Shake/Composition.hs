@@ -95,6 +95,11 @@ instance (Namespace n1, Namespace n2) => Namespace (n1 :+: n2) where
 
     defaultRule (LeftName n1) = liftRule' (fromLeftName, fromLeftEntry) (LeftName, LeftEntry) defaultRule (LeftName n1)
     defaultRule (RightName n2) = liftRule' (fromRightName, fromRightEntry) (RightName, RightEntry) defaultRule (RightName n2)
+    
+    data Snapshot (n1 :+: n2) = UnionSnapshot (Snapshot n1) (Snapshot n2)
+    
+    takeSnapshot = liftM2 UnionSnapshot takeSnapshot takeSnapshot
+    compareSnapshots ns (UnionSnapshot ss1 ss2) (UnionSnapshot ss1' ss2') = compareSnapshots [n1 | LeftName n1 <- ns] ss1 ss1' ++ compareSnapshots [n2 | RightName n2 <- ns] ss2 ss2'
 
 
 -- | It is occasionally useful to have a "unit" namespace that is a subtype of everything. There are no (non-bottom) names of this type.
@@ -112,6 +117,9 @@ instance NFData Empty
 
 instance Namespace Empty where
     type Entry Empty = Empty
+    data Snapshot Empty = EmptySnapshot
+    takeSnapshot = return EmptySnapshot
+    compareSnapshots _ EmptySnapshot EmptySnapshot = []
 
 
 liftRule :: (nsub :< nsup) => Rule' ntop nsub -> Rule' ntop nsup
