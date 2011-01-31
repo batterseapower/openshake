@@ -10,11 +10,11 @@ import Control.Monad.IO.Class
 main :: IO ()
 main = shake $ do
     "access-without-need" *> \x -> do
-        liftIO $ readFile "accessed-without-need"
+        liftIO $ readFile "accessed-without-need" >>= putStrLn -- It's very important we actually use the contents of the file, or it doesn't count as an access!
         system' ["touch", "access-without-need"]
     
     "access-before-need" *> \x -> do
-        liftIO $ readFile "accessed-before-need"
+        liftIO $ readFile "accessed-before-need" >>= putStrLn -- Ditto
         need ["accessed-before-need"]
         system' ["touch", "access-before-need"]
     
