@@ -428,7 +428,7 @@ doesQARequireRerun need (Need nested_fps_times) = do
 type Lint' n = State.StateT (Maybe (Snapshot n)) IO
 
 -- If in non-linting mode, run actions in parallel. Otherwise, run them sequentially so we can validate the changes made at every step
-parallelLint' :: Pool -> [State.StateT (Maybe s) IO a] -> State.StateT (Maybe s) IO [a]
+parallelLint' :: Pool -> [Lint' n a] -> Lint' n [a]
 parallelLint' pool acts = State.StateT $ \mb_s -> case mb_s of Nothing -> liftM (,Nothing) $ parallel pool $ map (\act -> liftM fst $ State.runStateT act Nothing) acts
                                                                Just s  -> State.runStateT (sequence acts) (Just s) -- FIXME: not cool -- deadlock
 
