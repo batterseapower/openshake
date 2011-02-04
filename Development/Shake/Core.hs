@@ -43,11 +43,12 @@ import qualified Data.ByteString.Lazy as BS
 
 import Data.Typeable (Typeable) -- For Exception only
 
-import Control.Applicative (Applicative)
+import Control.Applicative (Applicative(..))
 import Control.Arrow (first, second)
 
 import Control.Concurrent.MVar
-import Control.Concurrent.ParallelIO.Local
+import Control.Concurrent.ParallelIO.Local (Pool)
+import qualified Control.Concurrent.ParallelIO.Local as Parallel
 
 import Control.DeepSeq
 import qualified Control.Exception.Peel as Exception
@@ -69,7 +70,6 @@ import Data.Ord
 import Data.List
 import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
 import Data.Foldable (traverse_)
-import Data.Traversable (Traversable(traverse))
 
 import System.Environment
 import System.IO.Unsafe (unsafePerformIO) -- For command line parsing hack only
@@ -296,7 +296,6 @@ instance Namespace n => Binary (QA n) where
 
 data ActState n = AS {
     as_this_history :: History n,
-    as_last_snapshot :: Maybe (Snapshot n),
     as_snapshots :: [(Snapshot n, Snapshot n, [n])]
   }
 
@@ -312,10 +311,24 @@ data ActEnv n = AE {
   }
 
 
-newtype Act n a = Act { unAct :: Reader.ReaderT (ActEnv n) (State.StateT (ActState n) IO) a }
-              deriving (Functor, Applicative, Monad, MonadIO, MonadPeelIO)
+data Act n a = Act { unAct :: forall m. (MonadLint m, LintNamespace m ~ n) => Reader.ReaderT (ActEnv n) (State.StateT (ActState n) m) a }
 
-runAct :: ActEnv n -> ActState n -> Act n a -> IO (a, ActState n)
+instance Functor (Act n) where
+    fmap = liftM
+
+instance Applicative (Act n) where
+    pure = return
+    (<*>) = ap
+
+instance Monad (Act n) where
+    return x = Act (return x)
+    Act mx >>= fxmy = Act $ mx >>= \x -> case fxmy x of Act it -> it
+
+instance MonadIO (Act n) where
+    liftIO io = Act (liftIO io)
+
+
+runAct :: (MonadLint m, LintNamespace m ~ n) => ActEnv n -> ActState n -> Act n a -> m (a, ActState n)
 runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
 
 -- getActState :: Act ActState
@@ -344,8 +357,8 @@ putStrLnAt at_verbosity msg = do
 shake :: Namespace n => Shake n () -> IO ()
 shake = shakeWithOptions defaultShakeOptions
 
-shakeWithOptions :: Namespace n => ShakeOptions -> Shake n () -> IO ()
-shakeWithOptions opts mx = withPool (shakeThreads opts) $ \pool -> do
+shakeWithOptions :: forall n. Namespace n => ShakeOptions -> Shake n () -> IO ()
+shakeWithOptions opts mx = Parallel.withPool (shakeThreads opts) $ \pool -> do
     mb_bs <- handleDoesNotExist (return Nothing) $ fmap Just $ BS.readFile ".openshake-db"
     db <- case mb_bs of
         Nothing -> do
@@ -363,12 +376,24 @@ shakeWithOptions opts mx = withPool (shakeThreads opts) $ \pool -> do
     wdb_mvar <- newMVar emptyWaitDatabase
     report_mvar <- emptyReportDatabase >>= newMVar
 
-    mb_ss <- if shakeLint opts then fmap Just takeSnapshot else return Nothing
-
     -- Collect rules and wants, then execute the collected Act actions (in any order)
     let ((), complete_s) = runShake (SE { se_available_rules = [ss_rules complete_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
-    _ <- flip State.runStateT mb_ss $ parallelLint' pool $ flip map (ss_acts complete_s) $ \(act_rules, act) ->
-            runActLinted [] (AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }) act
+
+        -- You might think that we could lose the type signature here, and then inline mk_e into its sole use site.
+        -- Unfortunately, that doesn't type check properly on GHC 7.0.1.20101215 (i.e. RC2), and I have no idea why.
+        mk_e :: [[RuleClosure n]] -> ActEnv n
+        mk_e act_rules = AE { ae_would_block_handles = [], ae_rules = act_rules, ae_database = db_mvar, ae_wait_database = wdb_mvar, ae_report = report_mvar, ae_pool = pool, ae_options = opts }
+        
+        run_acts :: forall m. (MonadLint m, LintNamespace m ~ n) => m ()
+        run_acts = void $ parallel pool $ flip map (ss_acts complete_s) $ \(act_rules, act) -> runActLinted [] (mk_e act_rules) act
+    
+    if shakeLint opts
+     then do
+      ss_mvar <- newEmptyMVar
+      ss <- takeSnapshot
+      (x, _) <- (flip State.runStateT ss . flip Reader.runReaderT ss_mvar) $ unLint' run_acts
+      return x
+     else unNoLint run_acts
     
     final_report <- takeMVar report_mvar
     traverse_ (\report_fp -> writeFile report_fp (produceReport final_report)) (shakeReport opts)
@@ -395,16 +420,9 @@ need fps = do
     e <- askActEnv
     
     need_times <- Act $ Reader.ReaderT $ \_ -> State.StateT $ \s -> do
-        -- Record data so we can lint the IO done in between entering a user rule and it invoking need
-        (sss, mb_ss) <- case (as_last_snapshot s) of
-          Nothing -> return (as_snapshots s, Nothing)
-          Just ss -> do
-            ss' <- takeSnapshot
-            -- Rule code tranisitioned from ss to ss' before needing fps
-            return ((ss, ss', fps) : as_snapshots s, Just ss')
-        
-        (need_times, mb_ss) <- State.runStateT (need' e fps) mb_ss
-        return (need_times, s { as_snapshots = sss, as_last_snapshot = mb_ss })
+        mb_sss <- retakeSnapshot fps
+        need_times <- need' e fps
+        return (need_times, s { as_snapshots = maybe id (:) mb_sss (as_snapshots s) })
     
     appendHistory $ Need (fps `zip` need_times)
     return need_times
@@ -425,21 +443,74 @@ doesQARequireRerun need (Need nested_fps_times) = do
         \fp old_time new_time -> guard (old_time /= new_time) >> return ("modification time of " ++ show fp ++ " has changed from " ++ show old_time ++ " to " ++ show new_time)
 
 
-type Lint' n = State.StateT (Maybe (Snapshot n)) IO
+class (Functor m, Monad m, MonadIO m, MonadPeelIO m) => MonadLint m where
+    type LintNamespace m
+    parallel :: Pool -> [m a] -> m [a]
+    modifyMVarLint :: MVar a -> (a -> m (a, b)) -> m b
+    retakeSnapshot :: [LintNamespace m] -> m (Maybe (Snapshot (LintNamespace m), Snapshot (LintNamespace m), [LintNamespace m]))
 
--- If in non-linting mode, run actions in parallel. Otherwise, run them sequentially so we can validate the changes made at every step
-parallelLint' :: Pool -> [Lint' n a] -> Lint' n [a]
-parallelLint' pool acts = State.StateT $ \mb_s -> case mb_s of Nothing -> liftM (,Nothing) $ parallel pool $ map (\act -> liftM fst $ State.runStateT act Nothing) acts
-                                                               Just s  -> State.runStateT (sequence acts) (Just s) -- FIXME: not cool -- deadlock
 
-findAllRules :: Namespace n
+newtype NoLint n a = NoLint { unNoLint :: IO a }
+                  deriving (Functor, Monad, MonadIO, MonadPeelIO)
+
+instance MonadLint (NoLint n) where
+    type LintNamespace (NoLint n) = n
+    parallel pool = NoLint . Parallel.parallel pool . map unNoLint
+    modifyMVarLint mvar f = NoLint $ modifyMVar mvar (unNoLint . f)
+    retakeSnapshot _ = return Nothing
+
+
+newtype Lint' n a = Lint' { unLint' :: Reader.ReaderT (MVar (Snapshot n)) (State.StateT (Snapshot n) IO) a }
+                  deriving (Functor, Monad, MonadPeelIO)
+
+instance MonadIO (Lint' n) where
+    -- It might be better if I only did this when actually essential (i.e. the IO action may block)
+    liftIO io = lintIO (const io)
+
+lintIO :: ((Lint' n a -> IO a) -> IO b) -- ^ Supplies the IO action with a way to convert Lint actions into IO actions for the duration
+       -> Lint' n b
+lintIO f = Lint' $ Reader.ReaderT $ \ss_mvar -> State.StateT $ \ss -> do
+    -- Restore the most recent Snapshot to the MVar while running an outside action, in case
+    -- that outside IO action schedules another Lint' action that will update the current Snapshot.
+    putStrLn "Releasing snapshot"
+    putMVar ss_mvar ss
+    putStrLn "<Released snapshot"
+    x <- f $ \lint -> putStrLn "Nested snapshot reacquiring.." >> modifyMVar ss_mvar (\ss -> putStrLn ">Nested snapshot reacquired" >> liftM swap (State.runStateT (Reader.runReaderT (unLint' lint) ss_mvar) ss)) `tap_` putStrLn "<Nested snapshot released"
+    -- If we scheduled another Lint action during that last call, the Snapshot will have changed.
+    putStrLn "Reacquiring snapshot"
+    ss <- takeMVar ss_mvar
+    putStrLn ">Snapshot reaquired"
+    return (x, ss)
+
+instance Namespace n => MonadLint (Lint' n) where
+    type LintNamespace (Lint' n) = n
+    -- My first thought was that if in non-linting mode, we could just run actions in parallel. If in linting mode, we could run them sequentially
+    -- so we could validate the changes made at every step.
+    --
+    -- Unfortunately, this isn't very cool because a rule might need something that is already being built by another branch above. E.g. I could
+    -- need ["a", "b"], and the rule for ["a"] could need ["b"]. Now I'm screwed because the entry for "b" will be a WaitHandle, but waiting on it will
+    -- deadlock.
+    --
+    -- So I still need to keep around the mechanism of parallelism in lint mode, even though I only permit one thread to run at a time.
+    parallel pool acts = lintIO $ \lint_to_io -> Parallel.parallel pool (map lint_to_io acts)
+    
+    modifyMVarLint mvar f = Lint' $ Reader.ReaderT $ \e -> State.StateT $ \s -> modifyMVar mvar (\x -> liftM (\((a, b), s) -> (a, (b, s))) $ State.runStateT (Reader.runReaderT (unLint' (f x)) e) s)
+    
+    retakeSnapshot fps = Lint' $ Reader.ReaderT $ \_e -> State.StateT $ \ss -> do
+        -- Record data so we can lint the IO done in between entering a user rule and it invoking need
+        ss' <- takeSnapshot
+        -- Rule code tranisitioned from ss to ss' before needing fps
+        return (Just (ss, ss', fps), ss')
+
+
+findAllRules :: (Namespace n, MonadLint m, LintNamespace m ~ n)
              => ActEnv n
              -> [n]             -- ^ The files that we wish to find rules for
              -> [WaitHandle ()] -- ^ Handles that would be blocked if we blocked the thread right now
              -> PureDatabase n
-             -> Lint' n (PureDatabase n,
-                         ([(n,   Lint' n (Either ShakefileException (Entry n)))],  -- Action that just waits for a build in progress elsewhere to complete
-                          [([n], Lint' n (Either ShakefileException [Entry n]))])) -- Action that creates (possibly several) of the files we asked for by invoking a user rule
+             -> m (PureDatabase n,
+                   ([(n,   m (Either ShakefileException (Entry n)))],  -- Action that just waits for a build in progress elsewhere to complete
+                    [([n], m (Either ShakefileException [Entry n]))])) -- Action that creates (possibly several) of the files we asked for by invoking a user rule
 findAllRules _ []       _                   db = return (db, ([], []))
 findAllRules e (fp:fps) would_block_handles db = do
     (fps, would_block_handles, db, res_transformer) <- do
@@ -457,7 +528,7 @@ findAllRules e (fp:fps) would_block_handles db = do
               may_wait <- mayWaitOnWaitHandle wait_mvar
               let wrapper | may_wait  = reportWorkerBlocked (ae_report e) .
                                         registerWait (ae_wait_database e) fp (fmap (const ()) wait_mvar) (ae_would_block_handles e) .
-                                        extraWorkerWhileBlocked (ae_pool e) -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
+                                        Parallel.extraWorkerWhileBlocked (ae_pool e) -- NB: We must spawn a new pool worker while we wait, or we might get deadlocked by depleting the pool of workers
                           | otherwise = id
               -- NB: we communicate the ModTimes of files that we were waiting on the completion of via the BuildingWaitHandle
               wrapper (waitOnWaitHandle wait_mvar)
@@ -569,24 +640,21 @@ findAllRules e (fp:fps) would_block_handles db = do
   where
     verbosity = shakeVerbosity (ae_options e)
 
-modifyMVarLint' :: MVar a -> (a -> Lint' n (a, b)) -> Lint' n b
-modifyMVarLint' mvar f = State.StateT $ \s -> modifyMVar mvar (\x -> liftM (\((a, b), s) -> (a, (b, s))) $ State.runStateT (f x) s)
-
-need' :: Namespace n => ActEnv n -> [n] -> Lint' n [Entry n]
+need' :: (Namespace n, MonadLint m, LintNamespace m ~ n) => ActEnv n -> [n] -> m [Entry n]
 need' e init_fps = do
     -- Figure out the rules we need to use to create all the dirty files we need
     --
     -- NB: this MVar operation does not block us because any thread only holds the database lock
     -- for a very short amount of time (and can only do IO stuff while holding it, not Act stuff).
     -- When we have to recursively invoke need, we put back into the MVar before doing so.
-    (cleans, uncleans) <- modifyMVarLint' (ae_database e) $ findAllRules e init_fps []
+    (cleans, uncleans) <- modifyMVarLint (ae_database e) $ findAllRules e init_fps []
     
     -- Run the rules we have decided upon in parallel
     --
     -- NB: we report that the thread using parallel is blocked because it may go on to actually
     -- execute one of the parallel actions, which will bump the parallelism count without any
     -- extra parallelism actually occuring.
-    unclean_times <- reportWorkerBlocked (ae_report e) $ parallelLint' (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ liftM (fmapEither (map show unclean_fps,) (unclean_fps `zip`)) rule
+    unclean_times <- reportWorkerBlocked (ae_report e) $ parallel (ae_pool e) $ flip map uncleans $ \(unclean_fps, rule) -> reportWorkerRunning (ae_report e) $ liftM (fmapEither (map show unclean_fps,) (unclean_fps `zip`)) rule
     
     -- For things that are being built by someone else we only do trivial work, so don't have to spawn any thread
     clean_times <- forM cleans $ \(clean_fp, rule) -> liftM (fmapEither ([show clean_fp],) (\mtime -> [(clean_fp, mtime)])) rule
@@ -759,9 +827,9 @@ updateStatus db_mvar fp_statuses = modifyMVar_ db_mvar (return . go)
 appendHistory :: QA n -> Act n ()
 appendHistory extra_qa = modifyActState $ \s -> s { as_this_history = as_this_history s ++ [extra_qa] }
 
-findRule :: Namespace n
+findRule :: (Namespace n, MonadLint m, LintNamespace m ~ n)
          => Verbosity -> [[RuleClosure n]] -> n
-         -> IO ([n], ([[RuleClosure n]] -> ActEnv n) -> Lint' n (History n, [Entry n]))
+         -> IO ([n], ([[RuleClosure n]] -> ActEnv n) -> m (History n, [Entry n]))
 findRule verbosity ruless fp = do
     possibilities <- flip mapMaybeM ruless $ \rules -> do
         generators <- mapMaybeM (\rc -> liftM (fmap ((,) (rc_closure rc))) $ rc_rule rc fp) rules
@@ -781,11 +849,11 @@ findRule verbosity ruless fp = do
 
     return (creates_fps, \mk_e -> runActLinted creates_fps (mk_e clo_rules) action)
 
-runActLinted :: Namespace n => [n] -> ActEnv n -> Act n a -> Lint' n (History n, a)
-runActLinted creates_fps e action = State.StateT $ \mb_ss -> do
-    (res, final_nested_s) <- runAct e (AS { as_this_history = [], as_snapshots = [], as_last_snapshot = mb_ss }) action
-    mb_ss <- flip traverse (as_last_snapshot final_nested_s) $ \ss -> tap takeSnapshot $ \ss' -> do
-        -- FIXME: accumulate errors rather than showing them eagerly like this
-        -- User code transitioned from ss to ss' before returning without needing anything else
-        mapM_ putStrLn $ lintSnapshots creates_fps (reverse $ (ss, ss', []) : as_snapshots final_nested_s)
-    return ((as_this_history final_nested_s, res), mb_ss)
+runActLinted :: (Namespace n, MonadLint m, LintNamespace m ~ n) => [n] -> ActEnv n -> Act n a -> m (History n, a)
+runActLinted creates_fps e action = do
+    (res, final_nested_s) <- runAct e (AS { as_this_history = [], as_snapshots = [] }) action
+    -- User code transitioned from ss to ss' before returning without needing anything else
+    mb_sss <- retakeSnapshot []
+    -- FIXME: accumulate errors rather than showing them eagerly like this
+    liftIO $ mapM_ putStrLn $ lintSnapshots creates_fps (reverse $ maybe id (:) mb_sss (as_snapshots final_nested_s))
+    return (as_this_history final_nested_s, res)
