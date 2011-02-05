@@ -73,7 +73,6 @@ import Data.Foldable (traverse_)
 
 import System.Environment
 import System.IO.Unsafe (unsafePerformIO) -- For command line parsing hack only
-import System.Random -- Debugging
 
 import GHC.Conc (numCapabilities)
 
