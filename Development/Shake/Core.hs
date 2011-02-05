@@ -73,6 +73,7 @@ import Data.Foldable (traverse_)
 
 import System.Environment
 import System.IO.Unsafe (unsafePerformIO) -- For command line parsing hack only
+import System.Random -- Debugging
 
 import GHC.Conc (numCapabilities)
 
@@ -455,6 +456,7 @@ class (Functor m, Monad m, MonadIO m, MonadPeelIO m) => MonadLint m where
     parallel :: Pool -> [m a] -> m [a]
     modifyMVarLint :: MVar a -> (a -> m (a, b)) -> m b
     retakeSnapshot :: [LintNamespace m] -> m (Maybe (Snapshot (LintNamespace m), Snapshot (LintNamespace m), [LintNamespace m]))
+    liftBlockingIO :: IO a -> m a
 
 
 newtype NoLint n a = NoLint { unNoLint :: IO a }
@@ -465,29 +467,22 @@ instance MonadLint (NoLint n) where
     parallel pool = NoLint . Parallel.parallel pool . map unNoLint
     modifyMVarLint mvar f = NoLint $ modifyMVar mvar (unNoLint . f)
     retakeSnapshot _ = return Nothing
+    liftBlockingIO = liftIO
 
 
 newtype Lint' n a = Lint' { unLint' :: Reader.ReaderT (MVar (Snapshot n)) (State.StateT (Snapshot n) IO) a }
-                  deriving (Functor, Monad, MonadPeelIO)
-
-instance MonadIO (Lint' n) where
-    -- It might be better if I only did this when actually essential (i.e. the IO action may block)
-    liftIO io = lintIO (const io)
+                  deriving (Functor, Monad, MonadIO, MonadPeelIO)
 
 lintIO :: ((Lint' n a -> IO a) -> IO b) -- ^ Supplies the IO action with a way to convert Lint actions into IO actions for the duration
        -> Lint' n b
 lintIO f = Lint' $ Reader.ReaderT $ \ss_mvar -> State.StateT $ \ss -> do
     -- Restore the most recent Snapshot to the MVar while running an outside action, in case
     -- that outside IO action schedules another Lint' action that will update the current Snapshot.
-    putStrLn "Releasing snapshot"
     putMVar ss_mvar ss
-    putStrLn "<Released snapshot"
-    x <- f $ \lint -> putStrLn "Nested snapshot reacquiring.." >> modifyMVar ss_mvar (\ss -> putStrLn ">Nested snapshot reacquired" >> liftM swap (State.runStateT (Reader.runReaderT (unLint' lint) ss_mvar) ss)) `tap_` putStrLn "<Nested snapshot released"
+    res <- f $ \lint -> modifyMVar ss_mvar (\ss -> liftM swap (State.runStateT (Reader.runReaderT (unLint' lint) ss_mvar) ss))
     -- If we scheduled another Lint action during that last call, the Snapshot will have changed.
-    putStrLn "Reacquiring snapshot"
     ss <- takeMVar ss_mvar
-    putStrLn ">Snapshot reaquired"
-    return (x, ss)
+    return (res, ss)
 
 instance Namespace n => MonadLint (Lint' n) where
     type LintNamespace (Lint' n) = n
@@ -509,6 +504,8 @@ instance Namespace n => MonadLint (Lint' n) where
         -- Rule code tranisitioned from ss to ss' before needing fps
         return (Just (ss, ss', fps), ss')
 
+    liftBlockingIO io = lintIO (const io)
+
 
 findAllRules :: (Namespace n, MonadLint m, LintNamespace m ~ n)
              => ActEnv n
@@ -529,7 +526,7 @@ findAllRules e (fp:fps) would_block_handles db = do
              -- We've previously discovered the file to be clean: return an action that just returns the computed entry directly
             Just (Clean _ mtime)        -> Right $ return (Right mtime)
              -- Someone else is in the process of making the file clean. Return an action that wait on the wait handle for it to complete
-            Just (Building _ wait_mvar) -> Right $ liftIO $ do
+            Just (Building _ wait_mvar) -> Right $ liftBlockingIO $ do
               -- We can avoid a lot of fuss if the wait handle is already triggered, so there can be no waiting.
               -- This is purely a performance optimisation:
               may_wait <- mayWaitOnWaitHandle wait_mvar
