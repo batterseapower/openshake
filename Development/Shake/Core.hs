@@ -327,6 +327,13 @@ instance Monad (Act n) where
 instance MonadIO (Act n) where
     liftIO io = Act (liftIO io)
 
+instance MonadPeelIO (Act n) where
+    -- Thanks to Anders Kaseorg for this definition (I added a bit of NoLint wrapping to work around the LintNamespace constraint)
+    peelIO = toAct (liftM (\k (Act mx) -> liftM toAct (k mx)) peelIO)
+      where
+        toAct :: Reader.ReaderT (ActEnv n) (State.StateT (ActState n) (NoLint n)) a -> Act n a
+        toAct mx = Act (Reader.mapReaderT (State.mapStateT (liftIO . unNoLint)) mx)
+
 
 runAct :: (MonadLint m, LintNamespace m ~ n) => ActEnv n -> ActState n -> Act n a -> m (a, ActState n)
 runAct e s mx = State.runStateT (Reader.runReaderT (unAct mx) e) s
