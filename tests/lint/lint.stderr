@@ -1,0 +1,3 @@
+./accessed-without-need was accessed without 'need'ing it first
+./accessed-before-need was accessed without 'need'ing it first
+dummy-file was 'need'ed without ever being accessed
