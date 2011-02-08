@@ -116,7 +116,7 @@ instance Namespace CanonicalFilePath where
             -- check will catch the change.
             Just nested_time -> return $ Just ([fp], return [nested_time]) -- TODO: distinguish between files created b/c of rule match and b/c they already exist in history? Lets us rebuild if the reason changes.
     
-    data Snapshot CanonicalFilePath = CFPSS (M.Map CanonicalFilePath ClockTime)
+    data Snapshot CanonicalFilePath = CFPSS { unCFPSS :: M.Map CanonicalFilePath ClockTime }
     
     takeSnapshot = do
         cwd <- getCurrentDirectory >>= canonical
@@ -134,20 +134,29 @@ instance Namespace CanonicalFilePath where
              then return (seen', S.insert fp seen_files)
              else getDirectoryContents (canonicalFilePath fp) >>= (foldM (explore fp) (seen', seen_files) . map (originalFilePath fp </>))
 
-    compareSnapshots building_fps needed_fps (CFPSS ss) (CFPSS ss') = [show fp ++ " was " ++ reason ++ " without 'need'ing it" | (fp, reason) <- accessed_no_need]
+    -- TODO: I could lint modification times as well? For example, you should probably not modify a file you need
+    lintSnapshots building_fps = go S.empty S.empty S.empty
       where
-        (ss_deleted, ss_continued, _ss_created) = zipMaps ss ss'
-        ss_accessed = M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
-        
-        -- 1) We must not be allowed to access/delete files that we didn't "need" or are building
-        accessed_no_need = filter (\(fp, _reason) -> not $ fp `elem` (building_fps ++ needed_fps)) (map (,"deleted") (M.keys ss_deleted) ++ map (,"read or written to") (M.keys ss_accessed))
-        -- 2) We should not "need" files that we didn't access
-        -- FIXME: I shouldn't be doing this until the very last need..
-        --needed_no_access = filter (\fp -> not $ fp `M.member` ss_accessed) fps
-        -- 3) We must not create files there are rules for but are not in our "also" list
-        -- FIXME
-        -- 4) We should not delete files there are rules for, even if we previously "need"ed them
-        -- FIXME
+        go needed accessed accessed_without_need history = case history of
+            []                          -> [show fp ++ " was accessed without 'need'ing it first" | fp <- S.toList (accessed_without_need S.\\ S.fromList building_fps)] ++
+                                           [show fp ++ " was 'need'ed without ever being accessed" | not (null building_fps), fp <- S.toList needed_without_access]
+                                           -- It is OK to need something "uselessly" at the top level, hence the check against building_fps here
+              where -- 2) We should not "need" files that we never access
+                    needed_without_access = needed S.\\ accessed
+            ((ss, ss', needs):history') -> go -- a) In the successor, it is now OK to access anything we just "need"ed
+                                              (needed `S.union` S.fromList needs)
+                                              -- b) In the successor, we need not warn about over-needing those things we have just accessed
+                                              (accessed `S.union` accesses)
+                                              -- 1) We should not be allowed to access files that we didn't "need" or are building
+                                              (accessed_without_need `S.union` (accesses S.\\ needed))
+                                              history'
+              where
+                (_ss_deleted, ss_continued, _ss_created) = zipMaps (unCFPSS ss) (unCFPSS ss')
+                accesses = M.keysSet $ M.filter (\(atime1, atime2) -> atime1 < atime2) ss_continued
+                -- 3) We should not create files there are rules for but are not in our "also" list
+                -- FIXME
+                -- 4) We should not delete files there are rules for
+                -- FIXME
 
 
 zipMaps :: Ord k => M.Map k v -> M.Map k v -> (M.Map k v, M.Map k (v, v), M.Map k v)

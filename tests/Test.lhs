@@ -45,9 +45,15 @@ seconds = (*1000000)
 traceShowM :: (Monad m, Show a) => m a -> m a
 traceShowM mx = mx >>= \x -> trace (show x) (return x)
 
+fst3 :: (a, b, c) -> a
+fst3 (a, _, _) = a
+
 
 assertEqualM :: (Eq a, Show a, Monad m) => a -> a -> m ()
 assertEqualM expected actual = if expected == actual then return () else fail $ show expected ++ " /= " ++ show actual
+
+assertEqualFileM :: FilePath -> String -> IO ()
+assertEqualFileM fp_expected actual = readFile fp_expected >>= \expected -> assertEqualM expected actual
 
 assertIsM :: (Show a, Monad m) => (a -> Bool) -> a -> m ()
 assertIsM expectation actual = if expectation actual then return () else fail $ show actual ++ " did not match our expectations"
@@ -64,17 +70,17 @@ timeoutForeign microsecs cleanup act = flip Exception.finally cleanup $ do
     timeout microsecs $ takeMVar mvar
 
 shake_ :: FilePath -> [String] -> IO ExitCode
-shake_ fp args = fmap fst $ shake fp args
+shake_ fp args = fmap fst3 $ shake fp args
 
-shake :: FilePath -> [String] -> IO (ExitCode, String)
-shake fp args = do
+shake :: FilePath -> [String] -> IO (ExitCode, String, String)
+shake fp args = {- (\res@(ec, stdout, stderr) -> putStrLn stdout >> putStrLn stderr >> return res) =<< -} do
    extra_args <- getArgs -- NB: this is a bit of a hack!
    
-   (_h_stdin, _h_stdout, h_stderr, ph) <- runInteractiveProcess "runghc" (["-i../../", fp] ++ args ++ extra_args) Nothing Nothing
-   mb_ec <- timeoutForeign (seconds 5) (terminateProcess ph) $ waitForProcess ph
+   (_h_stdin, h_stdout, h_stderr, ph) <- runInteractiveProcess "runghc" (["-i../../", fp] ++ args ++ extra_args) Nothing Nothing
+   mb_ec <- timeoutForeign (seconds 10) (terminateProcess ph) $ waitForProcess ph
    case mb_ec of
      Nothing -> error "shake took too long to run!"
-     Just ec -> fmap ((,) ec) $ hGetContents h_stderr
+     Just ec -> liftM2 ((,,) ec) (hGetContents h_stdout) (hGetContents h_stderr)
 
 -- | Shake can only detect changes that are reflected by changes to the modification time.
 -- Thus if we expect a rebuild we need to wait for the modification time used by the system to actually change.
@@ -104,19 +110,24 @@ mtimeSanityCheck = flip Exception.finally (removeFileIfExists "delete-me") $ do
     
     True `assertEqualM` (mtime1 /= mtime2 && mtime2 /= mtime3 && mtime1 /= mtime3)
 
+withTest :: FilePath -> [FilePath] -> IO a -> IO a
+withTest dir clean_fps act = do
+    putStr $ dir ++ ": "
+    res <- withCurrentDirectory dir $ do
+        clean (".openshake-db":clean_fps)
+        act
+    putStrLn "[OK]"
+    return res
+
 main :: IO ()
 main = do
     mtimeSanityCheck
     
-    withCurrentDirectory "lexical-scope" $ do
-        clean [".openshake-db", "examplefile"]
-        
+    withTest "lexical-scope" ["examplefile"] $ do
         ec <- shake_ "Shakefile.hs" []
         ExitSuccess `assertEqualM` ec
     
-    withCurrentDirectory "simple-c" $ do
-        clean [".openshake-db", "Main", "main.o", "constants.h"]
-        
+    withTest "simple-c" ["Main", "main.o", "constants.h"] $ do
         -- 1) Try a normal build. The first time around is a clean build, the second time we
         --    have to rebuild even though we already have Main:
         forM_ [42, 43] $ \constant -> do
@@ -145,9 +156,7 @@ main = do
 
     -- TODO: test that nothing goes wrong if we change the type of oracle between runs
 
-    withCurrentDirectory "deserialization-changes" $ do
-        clean [".openshake-db", "examplefile"]
-        
+    withTest "deserialization-changes" ["examplefile"] $ do
         -- 1) First run has no database, so it is forced to create the file
         ec <- shake_ "Shakefile-1.hs" []
         ExitSuccess `assertEqualM` ec
@@ -169,29 +178,21 @@ main = do
         x <- readFile "examplefile"
         "OK3" `assertEqualM` x
 
-    withCurrentDirectory "cyclic" $ do
-        clean [".openshake-db"]
-        
+    withTest "cyclic" [] $ do
         ec <- shake_ "Shakefile.hs" []
         isExitFailure `assertIsM` ec
     
-    withCurrentDirectory "cyclic-harder" $ do
-        clean [".openshake-db"]
-    
+    withTest "cyclic-harder" [] $ do
         ec <- shake_ "Shakefile.hs" []
         isExitFailure `assertIsM` ec
 
-    withCurrentDirectory "creates-directory-implicitly" $ do
-        clean [".openshake-db", "subdirectory" </> "foo"]
-        
+    withTest "creates-directory-implicitly" ["subdirectory" </> "foo"] $ do
         -- Even though our rule does not create the directory it is building into it should succeed
         ec <- shake_ "Shakefile.hs" []
         ExitSuccess `assertEqualM` ec
 
-    withCurrentDirectory "lazy-exceptions" $ do
-        clean [".openshake-db", "foo-dependency3"]
-        
-        (ec, stderr) <- shake "Shakefile.hs" ["-k"]
+    withTest "lazy-exceptions" ["foo-dependency3"] $ do
+        (ec, _stdout, stderr) <- shake "Shakefile.hs" ["-k"]
         
         -- All exceptions should be reported
         isExitFailure `assertIsM` ec
@@ -200,13 +201,11 @@ main = do
         -- We should have managed to build one of the things needed even though everything else died
         doesFileExist "foo-dependency3" >>= assertEqualM True
 
-    withCurrentDirectory "lint" $ do
-        clean [".openshake-db", "access-without-need", "access-before-need", "need-without-access"]
-        
-        (ec, stderr) <- shake "Shakefile.hs" ["--lint"]
+    withTest "lint" ["access-without-need", "access-before-need", "need-without-access"] $ do
+        (ec, _stdout, stderr) <- shake "Shakefile.hs" ["--lint"]
         
         -- All exceptions should be reported
         ExitSuccess `assertEqualM` ec
-        (\x -> all (`isInfixOf` x) ["access-without-need was accessed without 'need'ing it", "access-before-need was accessed without 'need'ing it"]) `assertIsM` stderr
+        "lint.stderr" `assertEqualFileM` stderr
 
 \end{code}
