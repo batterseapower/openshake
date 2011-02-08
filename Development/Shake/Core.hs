@@ -72,6 +72,7 @@ import Data.Time.Clock (UTCTime, NominalDiffTime, getCurrentTime, diffUTCTime)
 import Data.Foldable (traverse_)
 
 import System.Environment
+import System.IO
 import System.IO.Unsafe (unsafePerformIO) -- For command line parsing hack only
 
 import GHC.Conc (numCapabilities)
@@ -858,5 +859,5 @@ runActLinted creates_fps e action = do
     -- User code transitioned from ss to ss' before returning without needing anything else
     mb_sss <- retakeSnapshot []
     -- FIXME: accumulate errors rather than showing them eagerly like this
-    liftIO $ mapM_ putStrLn $ lintSnapshots creates_fps (reverse $ maybe id (:) mb_sss (as_snapshots final_nested_s))
+    liftIO $ mapM_ (hPutStrLn stderr) $ lintSnapshots creates_fps (reverse $ maybe id (:) mb_sss (as_snapshots final_nested_s))
     return (as_this_history final_nested_s, res)

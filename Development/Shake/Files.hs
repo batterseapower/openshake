@@ -136,6 +136,7 @@ instance Namespace CanonicalFilePath where
              then return (seen', S.insert fp seen_files)
              else getDirectoryContents (canonicalFilePath fp) >>= (foldM (explore fp) (seen', seen_files) . map (originalFilePath fp </>))
 
+    -- TODO: I could lint modification times as well? For example, you should probably not modify a file you need
     lintSnapshots building_fps = go S.empty S.empty S.empty
       where
         go needed accessed accessed_without_need history = case history of
