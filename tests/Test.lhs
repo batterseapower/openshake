@@ -110,14 +110,17 @@ mtimeSanityCheck = flip Exception.finally (removeFileIfExists "delete-me") $ do
     
     True `assertEqualM` (mtime1 /= mtime2 && mtime2 /= mtime3 && mtime1 /= mtime3)
 
-withTest :: FilePath -> [FilePath] -> IO a -> IO a
+withTest :: FilePath -> [FilePath] -> IO () -> IO ()
 withTest dir clean_fps act = do
-    putStr $ dir ++ ": "
-    res <- withCurrentDirectory dir $ do
-        clean (".openshake-db":clean_fps)
-        act
-    putStrLn "[OK]"
-    return res
+    want_tests <- getArgs
+    let should_run_test = null want_tests || dir `elem` want_tests
+    
+    when should_run_test $ do
+        putStr $ dir ++ ": "
+        withCurrentDirectory dir $ do
+            clean (".openshake-db":clean_fps)
+            act
+        putStrLn "[OK]"
 
 main :: IO ()
 main = do
