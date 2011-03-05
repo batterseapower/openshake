@@ -193,11 +193,11 @@ defaultShakeOptions = ShakeOptions {
 
 
 newtype ShakeEnv n = SE {
-    se_available_rules :: [[RuleClosure n]]
+    se_available_rules :: [[RuleClosure n]]    -- ^ Presented in corect (non-reversed) order
   }
 
 data ShakeState n = SS {
-    ss_rules :: [RuleClosure n],
+    ss_rules :: [RuleClosure n],               -- ^ Accumulated in reverse order
     ss_acts :: [([[RuleClosure n]], Act n ())]
   }
 
@@ -228,7 +228,7 @@ modifyShakeState f = Shake (State.modify f)
 -- helpful if you want to override particular 'need' calls with specialised actions.
 privateTo :: Shake n a -> (a -> Shake n b) -> Shake n b
 privateTo privates private_to = Shake $ State.StateT $ \s -> Reader.reader $ \e -> let (a, s') = Reader.runReader (State.runStateT (unShake privates) (s { ss_rules = [] })) e_private
-                                                                                       e_private = e { se_available_rules = ss_rules s' : se_available_rules e }
+                                                                                       e_private = e { se_available_rules = reverse (ss_rules s') : se_available_rules e }
                                                                                    in Reader.runReader (State.runStateT (unShake (private_to a)) (s' { ss_rules = ss_rules s })) e_private
 
 -- | Version of 'privateTo' where the two nested actions don't return anything
@@ -385,7 +385,7 @@ shakeWithOptions opts mx = Parallel.withPool (shakeThreads opts) $ \pool -> do
     report_mvar <- emptyReportDatabase >>= newMVar
 
     -- Collect rules and wants, then execute the collected Act actions (in any order)
-    let ((), complete_s) = runShake (SE { se_available_rules = [ss_rules complete_s] }) (SS { ss_rules = [], ss_acts = [] }) mx
+    let ((), complete_s) = runShake (SE { se_available_rules = [reverse (ss_rules complete_s)] }) (SS { ss_rules = [], ss_acts = [] }) mx
 
         -- You might think that we could lose the type signature here, and then inline mk_e into its sole use site.
         -- Unfortunately, that doesn't type check properly on GHC 7.0.1.20101215 (i.e. RC2), and I have no idea why.
@@ -838,8 +838,7 @@ findRule verbosity ruless fp = do
     possibilities <- flip mapMaybeM ruless $ \rules -> do
         generators <- mapMaybeM (\rc -> liftM (fmap ((,) (rc_closure rc))) $ rc_rule rc fp) rules
         return (guard (not (null generators)) >> Just generators)
-    -- To make sure we choose the first rule, we need to reverse the list of matches (we add them in reverse order)
-    (clo_rules, (creates_fps, action)) <- case reverse possibilities of
+    (clo_rules, (creates_fps, action)) <- case possibilities of
       (generator:other_matches):_next_level -> do
           unless (null other_matches) $
             when (verbosity > NormalVerbosity) $
