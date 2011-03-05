@@ -123,6 +123,13 @@ main :: IO ()
 main = do
     mtimeSanityCheck
     
+    withTest "ambiguous-rules" ["foo"] $ do
+        ec <- shake_ "Shakefile.hs" []
+        ExitSuccess `assertEqualM` ec
+        
+        x <- readFile "foo"
+        "First rule" `assertEqualM` x
+    
     withTest "lexical-scope" ["examplefile"] $ do
         ec <- shake_ "Shakefile.hs" []
         ExitSuccess `assertEqualM` ec
