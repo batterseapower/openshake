@@ -35,6 +35,8 @@ instance Oracle o => Namespace (Question o) where
 
     sanityCheck _ _ = return Nothing -- No way to sanity check oracle question without running it
     
+    -- FIXME: we have a major bug. Oracles won't be rerun if their "dependencies" are unchanged, so if e.g.
+    -- the contents of a directory is unchanged then ls won't be rerun to find the new answer.. crap
     defaultRule q = case defaultOracle of
         Nothing -> return Nothing
         Just o  -> liftIO $ oracleRule o q
