@@ -18,13 +18,21 @@ Build-Type:          Simple
 Library
         Exposed-Modules:        Development.Shake
                                 Development.Shake.C
+                                Development.Shake.Composition
+                                Development.Shake.Core.Binary
+                                Development.Shake.Core.Utilities
+                                Development.Shake.Core.WaitHandle
+                                Development.Shake.Core
+                                Development.Shake.Files
+                                Development.Shake.Oracles.Common
+                                Development.Shake.Oracles.FileSystem
+                                Development.Shake.Oracles.String
+                                Development.Shake.Oracles
                                 Development.Shake.System
-        Other-Modules:          Development.Shake.Utilities
-                                Development.Shake.WaitHandle
         
         Build-Depends:          base >= 3 && < 5, containers >= 0.3 && < 0.5, directory >= 1.0.1.1 && < 1.2,
                                 filepath >= 1.1 && < 1.3, old-time >= 1.0 && < 1.1, time >= 1.1.4 && < 1.3, process >= 1.0.1 && < 1.1,
                                 Glob >= 0.5.1 && < 0.6, transformers >= 0.2.2 && < 0.3,
                                 bytestring >= 0.9.1 && < 0.10, binary >= 0.5 && < 0.6, utf8-string >= 0.3.6 && < 0.4,
                                 parallel-io >= 0.2.1.1 && < 0.4, temporary >= 1.1 && < 1.2,
-                                deepseq >= 1.1 && < 1.2
+                                deepseq >= 1.1 && < 1.2, monad-peel >= 0.1 && < 0.2, access-time >= 0.1 && < 0.2

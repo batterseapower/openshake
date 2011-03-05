@@ -1,4 +1,4 @@
-{-# LANGUAGE ScopedTypeVariables, StandaloneDeriving, TypeFamilies #-}
+{-# LANGUAGE ScopedTypeVariables, StandaloneDeriving, TypeFamilies, EmptyDataDecls #-}
 {-# LANGUAGE TypeOperators, MultiParamTypeClasses, FlexibleContexts, FlexibleInstances, OverlappingInstances #-} -- For the (:<) subtyping relation
 module Development.Shake.Composition (
     -- * Composing namespaces
