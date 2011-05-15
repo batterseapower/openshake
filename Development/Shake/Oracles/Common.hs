@@ -33,10 +33,11 @@ class (Ord (Question o), Eq (Answer o),
 instance Oracle o => Namespace (Question o) where
     type Entry (Question o) = Answer o
 
-    sanityCheck _ _ = return Nothing -- No way to sanity check oracle question without running it
+    -- We always fail an oracle sanity check> If we don't, oracles won't be rerun if their "dependencies"
+    -- are unchanged, so if e.g. the contents of a directory is unchanged then ls won't be rerun to
+    -- find the new answer.
+    sanityCheck _ _ = return (Just "Oracle queries must always be rechecked")
     
-    -- FIXME: we have a major bug. Oracles won't be rerun if their "dependencies" are unchanged, so if e.g.
-    -- the contents of a directory is unchanged then ls won't be rerun to find the new answer.. crap
     defaultRule q = case defaultOracle of
         Nothing -> return Nothing
         Just o  -> liftIO $ oracleRule o q
