@@ -164,6 +164,15 @@ main = do
         ec <- shake_ "Shakefile.hs" []
         ExitSuccess `assertEqualM` ec
 
+    withTest "simple-hs" ["Main", "Main.hi", "Main.o", "Utility.hi", "Utility.o"] $ do
+        -- 1) Do the build
+        ec <- shake_ "Shakefile.hs" []
+        ExitSuccess `assertEqualM` ec
+
+        -- 2) Check the EXE is OK
+        out <- readProcess "./Main" [] ""
+        "2" `assertEqualM` out
+
     -- TODO: test that nothing goes wrong if we change the type of oracle between runs
 
     withTest "deserialization-changes" ["examplefile"] $ do
