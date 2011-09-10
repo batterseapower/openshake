@@ -122,6 +122,16 @@ withTest dir clean_fps act = do
             act
         putStrLn "[OK]"
 
+simpleTest :: FilePath -> FilePath -> String -> IO ()
+simpleTest shakefile main expect_out = do
+        -- 1) Do the build
+        ec <- shake_ shakefile []
+        ExitSuccess `assertEqualM` ec
+
+        -- 2) Check the EXE is OK
+        out <- readProcess main [] ""
+        expect_out`assertEqualM` out
+
 main :: IO ()
 main = do
     mtimeSanityCheck
@@ -164,16 +174,13 @@ main = do
         ec <- shake_ "Shakefile.hs" []
         ExitSuccess `assertEqualM` ec
 
-    withTest "simple-hs" ["Main", "Main.hi", "Main.o", "Utility.hi", "Utility.o"] $ do
-        -- 1) Do the build
-        ec <- shake_ "Shakefile.hs" []
-        ExitSuccess `assertEqualM` ec
-
-        -- 2) Check the EXE is OK
-        out <- readProcess "./Main" [] ""
-        "2" `assertEqualM` out
-
     -- TODO: test that nothing goes wrong if we change the type of oracle between runs
+
+    withTest "simple-hs" ["Main", "Main.hi", "Main.o", "Utility.hi", "Utility.o"] $ do
+        simpleTest "Shakefile.hs" "./Main" "2"
+
+    withTest "evan-hang" ["main", "App/Main.hi", "App/Main.o", "Util/Regex.hi", "Util/Regex.o"] $ do
+        simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\""
 
     withTest "deserialization-changes" ["examplefile"] $ do
         -- 1) First run has no database, so it is forced to create the file
