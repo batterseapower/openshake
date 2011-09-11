@@ -560,100 +560,114 @@ findAllRules e (fp:fps) would_block_handles db = do
              -- If this throws an exception, it is the fault of the **caller** of need so DON'T catch it
             (potential_creates_fps, potential_rule) <- liftIO $ findRule verbosity (ae_rules e) fp
             
-            let ei_why_rule_insane_unit = do
-                    -- 1) Basic sanity check that the rule creates the file we actually need
-                    unless (fp `elem` potential_creates_fps) $ Left $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
+            -- Cache the dirty status of each file the rule claims to create, just before we update the database. This information
+            -- is used in the rule sanity checker later on.
+            let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp db of Nothing -> False; Just (Dirty _ _) -> False; _ -> True) potential_creates_fps
             
-                    -- 2) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
+            -- NB: we have to find the rule and mark the things it may create as Building *before* we determine whether the
+            -- file is actually dirty according to its history. This is because if the file *is* dirty according to that history
+            -- then we want to prevent any recursive invocations of need from trying to Build some file that we have added a
+            -- pending_unclean entry for already
+            --
+            -- NB: people wanting *any* of the files created by this rule should wait on the same BuildingWaitHandle.
+            -- However, we fmap each instance of it so that it only reports the Entry information for exactly the file you care about.
+            (wait_handle, awake_waiters) <- liftIO newWaitHandle
+            db <- return $ foldr (\(potential_creates_fp, extractor) db -> M.insert potential_creates_fp (Building mb_hist (fmap (liftM extractor) wait_handle)) db) db (potential_creates_fps `zip` listExtractors)
+            
+            -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
+            would_block_handles <- return $ fmap (const ()) wait_handle : would_block_handles
+            
+            (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing            -> return (db, Right "file was not in the database")
+                                                                Just (hist, mtime) -> withoutMVar (ae_database e) db $ do
+                                                                  mb_dirty_reason <- firstJustM $ map (doesQARequireRerun (need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }))) hist
+                                                                  case mb_dirty_reason of
+                                                                    Just dirty_reason -> return $ Right dirty_reason
+                                                                    Nothing -> do
+                                                                      -- The file wasn't dirty, but it might be "insane". For files, this occurs when the file
+                                                                      -- has changed since we last looked at it even though its dependent files haven't changed.
+                                                                      -- This usually indicates some sort of bad thing has happened (e.g. editing a generated file) --
+                                                                      -- we just rebuild it directly, though we could make another choice:
+                                                                      mb_insane_reason <- liftIO $ sanityCheck fp mtime
+                                                                      return $ maybe (Left (hist, mtime)) Right mb_insane_reason
+            
+            -- Each rule we execute will block the creation of some files if it waits:
+            --   * It blocks the creation the files it *directly outputs*
+            --   * It blocks the creation of those files that will be created *by the caller* (after we return)
+            --
+            -- Note that any individual rule waiting *does not* block the creation of files built by other rules
+            -- being run right. This is because everything gets executed in parallel.
+            (creates_fps, basic_rule) <- case ei_clean_hist_dirty_reason of
+              Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
+              Right dirty_reason -> do
+                -- Definitely dirty: NOW we sanity check the rule that we found earlier.
+                let ei_why_rule_insane_unit = do
+                    -- a) Basic sanity check that the rule creates the file we actually need
+                    unless (fp `elem` potential_creates_fps) $ Left $ "A rule matched " ++ show fp ++ " but claims not to create it, only the files " ++ showStringList (map show potential_creates_fps)
+
+                    -- b) Make sure that none of the files that the proposed rule will create are not Dirty/unknown to the system.
                     --    This is because it would be unsafe to run a rule creating a file that might be in concurrent
                     --    use (read or write) by another builder process.
-                    let non_dirty_fps = filter (\non_dirty_fp -> case M.lookup non_dirty_fp db of Nothing -> False; Just (Dirty _ _) -> False; _ -> True) potential_creates_fps
+                    --
+                    --    It is VERY IMPORTANT that we delay doing this check until after we have checked the history to determine
+                    --    whether we need to rerun the rule. Here is the reason:
+                    --
+                    --    Imagine that we had a rule that promised to rebuild the files [Foo.hi, Foo.o] from [Bar.hi]. Further imagine
+                    --    that someone else already needed [Foo.hi] and we had checked its history so that was marked as Clean in the database.
+                    --
+                    --    Note that at this point [Foo.o] is still marked as dirty, [Foo.hi] is marked as clean, and the rule will promise
+                    --    to create both of them. If someone later needs [Foo.o] then if we do the sanity check eagerly things will look insane!
+                    --    What we want instead is to check the history of [Foo.o] *first* and hence detect that we don't need to run the rule. Then
+                    --    [Foo.o] will be marked as clean and all will be right with the world.
                     unless (null non_dirty_fps) $ Left $ "A rule promised to yield the files " ++ showStringList (map show potential_creates_fps) ++ " in the process of building " ++ show fp ++
                                                          ", but the files " ++ showStringList (map show non_dirty_fps) ++ " have been independently built by someone else"
                     
                     -- Everything is OK!
                     return ()
             
-            case ei_why_rule_insane_unit of
-               -- If the rule is busted, record the failed build attempt in the DB (may as well) and create a "clean" action that actually just raises an error.
-               -- By raising the error in the returned actions rather than right away we ensure that the exception gets reported as a problem in the files that
-               -- we needed, rather than a problem in the guy doing the needing
-              Left why_rule_insane -> return (fps, would_block_handles, M.insert fp (Failed sfe) db, second (first ((fp, return (Left sfe)) :)))
-                where sfe = RuleError why_rule_insane
-              Right () -> do
-                -- NB: we have to find the rule and mark the things it may create as Building *before* we determine whether the
-                -- file is actually dirty according to its history. This is because if the file *is* dirty according to that history
-                -- then we want to prevent any recursive invocations of need from trying to Build some file that we have added a
-                -- pending_unclean entry for already
-                --
-                -- NB: people wanting *any* of the files created by this rule should wait on the same BuildingWaitHandle.
-                -- However, we fmap each instance of it so that it only reports the Entry information for exactly the file you care about.
-                (wait_handle, awake_waiters) <- liftIO newWaitHandle
-                db <- return $ foldr (\(potential_creates_fp, extractor) db -> M.insert potential_creates_fp (Building mb_hist (fmap (liftM extractor) wait_handle)) db) db (potential_creates_fps `zip` listExtractors)
-            
-                -- If we block in recursive invocations of need' (if any), we will block the wait handle we just created from ever being triggered:
-                would_block_handles <- return $ fmap (const ()) wait_handle : would_block_handles
-            
-                (db, ei_clean_hist_dirty_reason) <- case mb_hist of Nothing            -> return (db, Right "file was not in the database")
-                                                                    Just (hist, mtime) -> withoutMVar (ae_database e) db $ do
-                                                                      mb_dirty_reason <- firstJustM $ map (doesQARequireRerun (need' (e { ae_would_block_handles = would_block_handles ++ ae_would_block_handles e }))) hist
-                                                                      case mb_dirty_reason of
-                                                                        Just dirty_reason -> return $ Right dirty_reason
-                                                                        Nothing -> do
-                                                                          -- The file wasn't dirty, but it might be "insane". For files, this occurs when the file
-                                                                          -- has changed since we last looked at it even though its dependent files haven't changed.
-                                                                          -- This usually indicates some sort of bad thing has happened (e.g. editing a generated file) --
-                                                                          -- we just rebuild it directly, though we could make another choice:
-                                                                          mb_insane_reason <- liftIO $ sanityCheck fp mtime
-                                                                          return $ maybe (Left (hist, mtime)) Right mb_insane_reason
-            
-                -- Each rule we execute will block the creation of some files if it waits:
-                --   * It blocks the creation the files it *directly outputs*
-                --   * It blocks the creation of those files that will be created *by the caller* (after we return)
-                --
-                -- Note that any individual rule waiting *does not* block the creation of files built by other rules
-                -- being run right. This is because everything gets executed in parallel.
-                (creates_fps, basic_rule) <- case ei_clean_hist_dirty_reason of
-                  Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
-                  Right dirty_reason -> do
+                case ei_why_rule_insane_unit of
+                   -- If the rule is busted, create a "clean" action that actually just raises an error. By raising the error in the returned actions rather than right
+                   -- away we ensure that the exception gets reported as a problem in the files that we needed, rather than a problem in the guy doing the needing
+                  Left why_rule_insane -> return ([fp], Exception.throwIO sfe)
+                    where sfe = RuleError why_rule_insane
+                  Right () -> do
                     when (verbosity >= ChattyVerbosity) $ putLog $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
                     return (potential_creates_fps, potential_rule (\rules -> e { ae_rules = rules, ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
             
-                let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
-                    -- What we should do is remove from the remaning uncleans any files that are created by the rule we just added
-                    (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
-                    all_fps_satisfied_here = fp : next_fps_satisifed_here
-              
-                    -- Augment the rule so that when it is run it sets all of the things it built to Clean again
-                    -- We also trim down the set of Entries it returns so that we only get entries for the *things
-                    -- we asked for*, not *the things the rule creates*
-                    rule = do
-                        -- Report any standard IO errors as ShakefileExceptions so we can delay them until the end
-                        -- At the same time, be careful not to wrap ShakefileExceptions from any nested needs.
-                        putLog $ "Running rule code to create " ++ showStringList (map show all_fps_satisfied_here)
-                        ei_sfe_result <- if shakeContinue (ae_options e)
-                                         then fmap (either (\e -> Left (ActionError (e :: Exception.SomeException))) id) $
-                                                   Exception.try (Exception.try basic_rule)
-                                         else fmap Right basic_rule
-                        -- Everything else does not need to be monitored by the linter
-                        liftIO $ do
-                            let (ei_sfe_mtimes, creates_statuses) = case ei_sfe_result of
-                                   -- Building the files succeeded, we should mark them as clean
-                                  Right (nested_hist, mtimes) -> (Right mtimes, map (Clean nested_hist) mtimes)
-                                   -- Building the files failed, so we need to mark it as such
-                                  Left sfe -> (Left sfe, repeat (Failed sfe))
-                            -- This is where we mark all of the files created by the rule as Clean/Failed:
-                            updateStatus (ae_database e) (creates_fps `zip` creates_statuses)
-                            -- Wake up all of the waiters on the old Building entry (if any)
-                            awake_waiters ei_sfe_mtimes
-                            -- Trim unnecessary modification times before we continue
-                            return $ fmap (\mtimes -> fromRight (\fp -> internalError $ "A pending unclean rule did not create the file " ++ show fp ++ " that we thought it did") $ lookupMany all_fps_satisfied_here (creates_fps `zip` mtimes)) ei_sfe_mtimes
+            let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
+                -- What we should do is remove from the remaning uncleans any files that are created by the rule we just added
+                (next_fps_satisifed_here, fps') = partition (`elem` creates_fps) fps
+                all_fps_satisfied_here = fp : next_fps_satisifed_here
             
-                -- Display a helpful message to the user explaining the rules that we have decided upon:
-                when (verbosity >= ChattyVerbosity) $
-                    putLog $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show all_fps_satisfied_here)
+                -- Augment the rule so that when it is run it sets all of the things it built to Clean again
+                -- We also trim down the set of Entries it returns so that we only get entries for the *things
+                -- we asked for*, not *the things the rule creates*
+                rule = do
+                    -- Report any standard IO errors as ShakefileExceptions so we can delay them until the end
+                    -- At the same time, be careful not to wrap ShakefileExceptions from any nested needs.
+                    when (verbosity >= ChattyVerbosity) $ putLog $ "Running rule code to create " ++ showStringList (map show all_fps_satisfied_here)
+                    ei_sfe_result <- if shakeContinue (ae_options e)
+                                     then fmap (either (\e -> Left (ActionError (e :: Exception.SomeException))) id) $
+                                               Exception.try (Exception.try basic_rule)
+                                     else fmap Right basic_rule
+                    -- Everything else does not need to be monitored by the linter
+                    liftIO $ do
+                        let (ei_sfe_mtimes, creates_statuses) = case ei_sfe_result of
+                               -- Building the files succeeded, we should mark them as clean
+                              Right (nested_hist, mtimes) -> (Right mtimes, map (Clean nested_hist) mtimes)
+                               -- Building the files failed, so we need to mark it as such
+                              Left sfe -> (Left sfe, repeat (Failed sfe))
+                        -- This is where we mark all of the files created by the rule as Clean/Failed:
+                        updateStatus (ae_database e) (creates_fps `zip` creates_statuses)
+                        -- Wake up all of the waiters on the old Building entry (if any)
+                        awake_waiters ei_sfe_mtimes
+                        -- Trim unnecessary modification times before we continue
+                        return $ fmap (\mtimes -> fromRight (\fp -> internalError $ "A pending unclean rule did not create the file " ++ show fp ++ " that we thought it did") $ lookupMany all_fps_satisfied_here (creates_fps `zip` mtimes)) ei_sfe_mtimes
             
-                return (fps', would_block_handles, db, second (second ((all_fps_satisfied_here, rule) :)))
+            -- Display a helpful message to the user explaining the rules that we have decided upon:
+            when (verbosity >= ChattyVerbosity) $
+                putLog $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show creates_fps) ++ ", of which we actually needed " ++ showStringList (map show all_fps_satisfied_here)
+            
+            return (fps', would_block_handles, db, second (second ((all_fps_satisfied_here, rule) :)))
     fmap res_transformer $ findAllRules e fps would_block_handles db
   where
     verbosity = shakeVerbosity (ae_options e)
