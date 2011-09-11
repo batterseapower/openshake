@@ -180,6 +180,8 @@ main = do
         simpleTest "Shakefile.hs" "./Main" "2"
 
     withTest "evan-hang" ["main", "App/Main.hi", "App/Main.o", "Util/Regex.hi", "Util/Regex.o"] $ do
+        -- The problem here manifested itself when doing a build on a tree just built from clean
+        simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\""
         simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\""
 
     withTest "deserialization-changes" ["examplefile"] $ do
