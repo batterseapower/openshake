@@ -354,10 +354,13 @@ askActEnv = Act Reader.ask
 actVerbosity :: Act n Verbosity
 actVerbosity = fmap (shakeVerbosity . ae_options) askActEnv
 
+putLog :: MonadIO m => String -> m ()
+putLog = liftIO . hPutStrLn stderr
+
 putStrLnAt :: Verbosity -> String -> Act n ()
 putStrLnAt at_verbosity msg = do
     verbosity <- actVerbosity
-    liftIO $ when (verbosity >= at_verbosity) $ putStrLn msg
+    when (verbosity >= at_verbosity) $ putLog msg
 
 
 -- NB: if you use shake in a nested way bad things will happen to parallelism
@@ -370,11 +373,11 @@ shakeWithOptions opts mx = Parallel.withPool (shakeThreads opts) $ \pool -> do
     mb_bs <- handleDoesNotExist (return Nothing) $ fmap Just $ BS.readFile ".openshake-db"
     db <- case mb_bs of
         Nothing -> do
-            when (shakeVerbosity opts >= NormalVerbosity) $ putStrLn "Database did not exist, doing full rebuild"
+            when (shakeVerbosity opts >= NormalVerbosity) $ putLog "Database did not exist, doing full rebuild"
             return M.empty
          -- NB: we force the input ByteString because we really want the database file to be closed promptly
         Just bs -> length (BS.unpack bs) `seq` (Exception.evaluate (rnf db) >> return db) `Exception.catch` \(Exception.ErrorCall reason) -> do
-            when (shakeVerbosity opts >= NormalVerbosity) $ putStrLn $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
+            when (shakeVerbosity opts >= NormalVerbosity) $ putLog $ "Database unreadable (" ++ reason ++ "), doing full rebuild"
             return M.empty
           where db = runGetAll getPureDatabase bs
     
@@ -603,7 +606,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                 (creates_fps, basic_rule) <- case ei_clean_hist_dirty_reason of
                   Left (clean_hist, clean_mtime) -> return ([fp], return (clean_hist, [clean_mtime])) -- NB: we checked that clean_mtime is still ok using sanityCheck above
                   Right dirty_reason -> do
-                    when (verbosity >= ChattyVerbosity) $ liftIO $ putStrLn $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
+                    when (verbosity >= ChattyVerbosity) $ putLog $ "Rebuild " ++ show fp ++ " because " ++ dirty_reason
                     return (potential_creates_fps, potential_rule (\rules -> e { ae_rules = rules, ae_would_block_handles = fmap (const ()) wait_handle : ae_would_block_handles e }))
             
                 let -- It is possible that we need two different files that are both created by the same rule. This is not an error!
@@ -617,6 +620,7 @@ findAllRules e (fp:fps) would_block_handles db = do
                     rule = do
                         -- Report any standard IO errors as ShakefileExceptions so we can delay them until the end
                         -- At the same time, be careful not to wrap ShakefileExceptions from any nested needs.
+                        putLog $ "Running rule code to create " ++ showStringList (map show all_fps_satisfied_here)
                         ei_sfe_result <- if shakeContinue (ae_options e)
                                          then fmap (either (\e -> Left (ActionError (e :: Exception.SomeException))) id) $
                                                    Exception.try (Exception.try basic_rule)
@@ -637,7 +641,7 @@ findAllRules e (fp:fps) would_block_handles db = do
             
                 -- Display a helpful message to the user explaining the rules that we have decided upon:
                 when (verbosity >= ChattyVerbosity) $
-                    liftIO $ putStrLn $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show all_fps_satisfied_here)
+                    putLog $ "Using rule instance for " ++ showStringList (map show creates_fps) ++ " to create " ++ showStringList (map show all_fps_satisfied_here)
             
                 return (fps', would_block_handles, db, second (second ((all_fps_satisfied_here, rule) :)))
     fmap res_transformer $ findAllRules e fps would_block_handles db
@@ -842,7 +846,7 @@ findRule verbosity ruless fp = do
       (generator:other_matches):_next_level -> do
           unless (null other_matches) $
             when (verbosity > NormalVerbosity) $
-              putStrLn $ "Ambiguous rules for " ++ show fp ++ ": choosing the first one"
+              putLog $ "Ambiguous rules for " ++ show fp ++ ": choosing the first one"
           return generator
       [] -> do
           mb_generator <- defaultRule fp
