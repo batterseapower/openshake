@@ -74,13 +74,20 @@ shake_ fp args = fmap fst3 $ shake fp args
 
 shake :: FilePath -> [String] -> IO (ExitCode, String, String)
 shake fp args = {- (\res@(ec, stdout, stderr) -> putStrLn stdout >> putStrLn stderr >> return res) =<< -} do
-   extra_args <- getArgs -- NB: this is a bit of a hack!
-   
-   (_h_stdin, h_stdout, h_stderr, ph) <- runInteractiveProcess "runghc" (["-i../../", fp] ++ args ++ extra_args) Nothing Nothing
-   mb_ec <- timeoutForeign (seconds 10) (terminateProcess ph) $ waitForProcess ph
-   case mb_ec of
-     Nothing -> error "shake took too long to run!"
-     Just ec -> liftM2 ((,,) ec) (hGetContents h_stdout) (hGetContents h_stderr)
+    extra_args <- getArgs -- NB: this is a bit of a hack!
+    
+    (_h_stdin, h_stdout, h_stderr, ph) <- runInteractiveProcess "runghc" (["-i../../", fp] ++ args ++ extra_args) Nothing Nothing
+    mb_ec <- timeoutForeign (seconds 10) (terminateProcess ph) $ waitForProcess ph
+    out <- hGetContents h_stdout
+    err <- hGetContents h_stderr
+
+    when ("-v" `elem` extra_args) $ do
+        hPutStrLn stdout out
+        hPutStrLn stderr err
+    
+    case mb_ec of
+      Nothing -> error "shake took too long to run!"
+      Just ec -> return (ec, out, err)
 
 -- | Shake can only detect changes that are reflected by changes to the modification time.
 -- Thus if we expect a rebuild we need to wait for the modification time used by the system to actually change.
@@ -112,7 +119,7 @@ mtimeSanityCheck = flip Exception.finally (removeFileIfExists "delete-me") $ do
 
 withTest :: FilePath -> [FilePath] -> IO () -> IO ()
 withTest dir clean_fps act = do
-    want_tests <- getArgs
+    want_tests <- liftM (filter (not . (== '-') . head)) getArgs
     let should_run_test = null want_tests || dir `elem` want_tests
     
     when should_run_test $ do
@@ -177,12 +184,12 @@ main = do
     -- TODO: test that nothing goes wrong if we change the type of oracle between runs
 
     withTest "simple-hs" ["Main", "Main.hi", "Main.o", "Utility.hi", "Utility.o"] $ do
-        simpleTest "Shakefile.hs" "./Main" "2"
+        simpleTest "Shakefile.hs" "./Main" "2\n"
 
     withTest "evan-hang" ["main", "App/Main.hi", "App/Main.o", "Util/Regex.hi", "Util/Regex.o"] $ do
         -- The problem here manifested itself when doing a build on a tree just built from clean
-        simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\""
-        simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\""
+        simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\"\n"
+        simpleTest "Shakefile.hs" "./main" "\"I'm a regex module!\"\n"
 
     withTest "deserialization-changes" ["examplefile"] $ do
         -- 1) First run has no database, so it is forced to create the file
