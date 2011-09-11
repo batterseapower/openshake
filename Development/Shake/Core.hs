@@ -438,8 +438,18 @@ need fps = do
     appendHistory $ Need (fps `zip` need_times)
     return need_times
 
-withoutMVar :: MonadIO m => MVar a -> a -> m b -> m (a, b)
-withoutMVar mvar x act = liftIO (putMVar mvar x) >> act >>= \y -> liftIO (takeMVar mvar) >>= \x' -> return (x', y)
+withoutMVar :: MonadPeelIO m => MVar a -> a -> m b -> m (a, b)
+withoutMVar mvar x act = do
+    liftIO (putMVar mvar x)
+    -- Suprisingly, it is important that we take from the MVar if there is an exception from act.
+    -- The reason is that we might have something like this:
+    --    modfiyMVar mvar $ \x -> withoutMVar mvar x $ throwIO e
+    --
+    -- If we don't take from the MVar when we get the exception, modifyMVar will block because
+    -- its onException handler tries to put into the (full) MVar.
+    y <- act `Exception.onException` liftIO (takeMVar mvar)
+    x' <- liftIO (takeMVar mvar)
+    return (x', y)
 
 -- We assume that the rules do not change to include new dependencies often: this lets
 -- us not rerun a rule as long as it looks like the dependencies of the *last known run*
