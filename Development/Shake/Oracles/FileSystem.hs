@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, FlexibleContexts, FlexibleInstances, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE TypeFamilies, TypeOperators, FlexibleContexts, FlexibleInstances, GeneralizedNewtypeDeriving #-}
 module Development.Shake.Oracles.FileSystem (
     -- * Oracle type
     FileSystemOracle,

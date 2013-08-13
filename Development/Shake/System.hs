@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleContexts, TypeOperators #-}
 module Development.Shake.System (
     system, system', systemStdout',
     copy, mkdir, readFileLines,

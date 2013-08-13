@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, GeneralizedNewtypeDeriving, FlexibleContexts, TupleSections #-}
+{-# LANGUAGE TypeFamilies, TypeOperators, GeneralizedNewtypeDeriving, FlexibleContexts, TupleSections #-}
 module Development.Shake.Files (
     -- * File modification times
     ModTime, getFileModTime,
@@ -30,9 +30,12 @@ import Control.Monad.IO.Class
 
 import Data.Traversable (Traversable(traverse))
 
+import Data.Int (Int64)
 import Data.List
 import qualified Data.Map as M
 import qualified Data.Set as S
+import Data.Time.Clock (UTCTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds, posixSecondsToUTCTime)
 
 import System.Directory
 import System.Directory.AccessTime
@@ -41,25 +44,18 @@ import System.FilePath.Glob
 import System.Time (ClockTime(..))
 
 
-type ModTime = ClockTime
+type ModTime = UTCTime
 
 -- TODO: remove orphan instance
-instance NFData ClockTime where
-    rnf = rnfModTime
-
--- TODO: remove orphan instance
-instance Binary ClockTime where
+instance Binary UTCTime where
     get = getModTime
     put = putModTime
 
-rnfModTime :: ModTime -> ()
-rnfModTime (TOD a b) = rnf a `seq` rnf b
-
 getModTime :: Get ModTime
-getModTime = liftM2 TOD get get
+getModTime = fmap (posixSecondsToUTCTime . (/ 1000) . fromIntegral) (get :: Get Int64)
 
 putModTime :: ModTime -> Put
-putModTime (TOD a b) = put a >> put b
+putModTime mtime = put (round (utcTimeToPOSIXSeconds mtime * 1000) :: Int64)
 
 getFileModTime :: FilePath -> IO (Maybe ModTime)
 getFileModTime fp = handleDoesNotExist (return Nothing) (fmap Just (getModificationTime fp))
