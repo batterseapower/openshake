@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeFamilies, TypeOperators, GeneralizedNewtypeDeriving, FlexibleContexts, TupleSections #-}
+{-# LANGUAGE TypeFamilies, TypeOperators, GeneralizedNewtypeDeriving, FlexibleContexts, TupleSections, CPP #-}
 module Development.Shake.Files (
     -- * File modification times
     ModTime, getFileModTime,
@@ -32,6 +32,7 @@ import Data.Traversable (Traversable(traverse))
 
 import Data.Int (Int64)
 import Data.List
+import Data.List.Split (splitOn)
 import qualified Data.Map as M
 import qualified Data.Set as S
 import Data.Time.Clock (UTCTime)
@@ -85,8 +86,25 @@ canonical fp = do
     exists <- liftM2 (||) (doesFileExist fp) (doesDirectoryExist fp)
     if exists
       then fmap (UnsafeCanonicalise fp) $ canonicalizePath fp
-      else fmap (UnsafeCanonicalise fp . (</> fp)) getCurrentDirectory
+      else fmap (UnsafeCanonicalise fp . approximateCanonicalize . (</> fp)) getCurrentDirectory
 
+-- Used for non-existant filenames. Consequently, can only be approximately correct!
+-- Nonetheless, it's important that we make some sort of guess here, or else we get
+-- ridiculous behaviour like rules for ./Foo.hs not matching requests for ./Bar/../Foo.hs
+-- simply because Foo.hs doesn't yet exist.
+approximateCanonicalize :: FilePath -> FilePath
+approximateCanonicalize = intercalate [head seperators] . go 0 [] . splitOn seperators
+  where
+    go n acc     []        = replicate n ".." ++ reverse acc
+    go n acc     ("." :xs) = go n     acc     xs
+    go n []      ("..":xs) = go (n+1) []      xs
+    go n (_:acc) ("..":xs) = go n     acc     xs
+    go n acc     (x   :xs) = go n     (x:acc) xs
+#ifdef WINDOWS
+    seperators = "\\/"
+#else
+    seperators = "/"
+#endif
 
 instance Namespace CanonicalFilePath where
     type Entry CanonicalFilePath = ModTime

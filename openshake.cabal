@@ -35,4 +35,8 @@ Library
                                 Glob >= 0.5.1, transformers >= 0.2.2,
                                 bytestring >= 0.9.1, binary >= 0.5, utf8-string >= 0.3.6,
                                 parallel-io >= 0.2.1.1, temporary >= 1.1,
-                                deepseq >= 1.1, monad-peel >= 0.1, access-time >= 0.1
+                                deepseq >= 1.1, monad-peel >= 0.1, access-time >= 0.1,
+                                split >= 0.1.1
+
+        if os(windows)
+            Cpp-Options:        -DWINDOWS
